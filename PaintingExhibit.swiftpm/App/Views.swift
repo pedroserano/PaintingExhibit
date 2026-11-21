@@ -2,6 +2,12 @@ import SwiftUI
 import Photos
 import ImageIO
 
+#if os(iOS)
+import UIKit
+#else
+import AppKit
+#endif
+
 struct ContentView: View {
     @EnvironmentObject var library: Library
 
@@ -30,15 +36,27 @@ struct AccessView: View {
         ContentUnavailableView {
             Label("Photos access needed", systemImage: "photo.on.rectangle.angled")
         } description: {
+            #if os(iOS)
             Text("Painting Exhibit needs to read your paintings album. Turn on access in Settings.")
+            #else
+            Text("Painting Exhibit needs to read your paintings album. Turn on access in System Settings › Privacy & Security › Photos.")
+            #endif
         } actions: {
-            Button("Open Settings") {
-                if let url = URL(string: UIApplication.openSettingsURLString) {
-                    UIApplication.shared.open(url)
-                }
-            }
-            .buttonStyle(.borderedProminent)
+            Button("Open Settings") { openPrivacySettings() }
+                .buttonStyle(.borderedProminent)
         }
+    }
+
+    private func openPrivacySettings() {
+        #if os(iOS)
+        if let url = URL(string: UIApplication.openSettingsURLString) {
+            UIApplication.shared.open(url)
+        }
+        #else
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Photos") {
+            NSWorkspace.shared.open(url)
+        }
+        #endif
     }
 }
 
@@ -57,8 +75,44 @@ struct AlbumPickerView: View {
             }
         }
         .navigationTitle("Choose your paintings album")
+        #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
+        #endif
         .onAppear { albums = library.albums() }
+    }
+}
+
+// MARK: Settings
+
+struct SettingsView: View {
+    @EnvironmentObject var library: Library
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("Show frames", isOn: $library.keepFramesByDefault)
+            } footer: {
+                Text("You can still show or remove the frame on each painting.")
+            }
+
+            Section {
+                Toggle("Save edits to Photos", isOn: $library.saveEditsToPhotos)
+                if library.editedInPhotosCount > 0 {
+                    Button("Remove Edits from Photos (\(library.editedInPhotosCount))", role: .destructive) {
+                        Task { await library.removeEditsFromPhotos() }
+                    }
+                    .disabled(library.isProcessing)
+                }
+            } footer: {
+                Text("""
+                Also adds each painting's crop and corrections to the photo in Photos, as an edit. \
+                Photos keeps the original, so you can undo it with Revert to Original in Photos, \
+                or for all paintings with the button above. You'll be asked to allow each batch of changes. \
+                Reverting also removes any edits made in Photos before this app's edit.
+                """)
+            }
+        }
+        .formStyle(.grouped)
     }
 }
 
@@ -67,6 +121,7 @@ struct AlbumPickerView: View {
 struct GalleryView: View {
     @EnvironmentObject var library: Library
     @State private var selected: Painting?
+    @State private var showSettings = false
 
     private let columns = [GridItem(.adaptive(minimum: 150), spacing: 12)]
 
@@ -100,10 +155,6 @@ struct GalleryView: View {
         .navigationTitle(library.albumTitle ?? "Exhibit")
         .toolbar {
             Menu {
-                Toggle(isOn: $library.keepFramesByDefault) {
-                    Label("Show frames", systemImage: "square.dashed")
-                }
-                Divider()
                 Button("Check for new paintings", systemImage: "arrow.clockwise") {
                     Task { await library.processNew() }
                 }
@@ -113,6 +164,10 @@ struct GalleryView: View {
                 Button("Change album", systemImage: "rectangle.stack") {
                     library.albumID = nil
                 }
+                #if os(iOS)
+                Divider()
+                Button("Settings", systemImage: "gearshape") { showSettings = true }
+                #endif
             } label: {
                 Image(systemName: "ellipsis.circle")
             }
@@ -120,17 +175,33 @@ struct GalleryView: View {
         }
         .refreshable { await library.processNew() }
         .task { await library.processNew() }
+        #if os(iOS)
+        .sheet(isPresented: $showSettings) {
+            NavigationStack {
+                SettingsView()
+                    .navigationTitle("Settings")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar { Button("Done") { showSettings = false } }
+            }
+        }
         .fullScreenCover(item: $selected) { painting in
-            ExhibitView(startID: painting.id)
+            ExhibitView(startID: painting.id) { selected = nil }
                 .environmentObject(library)
         }
+        #else
+        .overlay {
+            if let painting = selected {
+                ExhibitView(startID: painting.id) { selected = nil }
+            }
+        }
+        #endif
     }
 }
 
 struct Thumbnail: View {
     @EnvironmentObject var library: Library
     let painting: Painting
-    @State private var image: UIImage?
+    @State private var image: CGImage?
 
     var body: some View {
         Rectangle()
@@ -138,7 +209,7 @@ struct Thumbnail: View {
             .aspectRatio(1, contentMode: .fit)
             .overlay {
                 if let image {
-                    Image(uiImage: image)
+                    Image(decorative: image, scale: 1)
                         .resizable()
                         .scaledToFit()
                         .shadow(color: .black.opacity(0.6), radius: 4, y: 2)
@@ -146,6 +217,7 @@ struct Thumbnail: View {
                 }
             }
             .clipShape(RoundedRectangle(cornerRadius: 6))
+            .contentShape(Rectangle())
             .task(id: painting.renderedAt) {
                 guard let url = await library.imageURL(for: painting) else { return }
                 image = await ImageLoader.load(url, maxPixel: 450)
@@ -157,59 +229,113 @@ struct Thumbnail: View {
 
 struct ExhibitView: View {
     @EnvironmentObject var library: Library
-    @Environment(\.dismiss) private var dismiss
     @State private var current: String
     @State private var showLabel = true
+    let close: () -> Void
 
-    init(startID: String) {
+    init(startID: String, close: @escaping () -> Void) {
         _current = State(initialValue: startID)
+        self.close = close
     }
 
     private var currentPainting: Painting? {
         library.paintings.first { $0.id == current }
     }
 
+    private func toggleLabel() {
+        withAnimation(.easeInOut(duration: 0.2)) { showLabel.toggle() }
+    }
+
     var body: some View {
         ZStack(alignment: .top) {
             Color.black.ignoresSafeArea()
-
-            TabView(selection: $current) {
-                ForEach(library.paintings) { painting in
-                    PaintingPage(painting: painting, showLabel: showLabel) {
-                        withAnimation(.easeInOut(duration: 0.2)) { showLabel.toggle() }
-                    }
-                    .tag(painting.id)
-                }
-            }
-            .tabViewStyle(.page(indexDisplayMode: .never))
-            .ignoresSafeArea()
-
+            pages
             if showLabel {
-                HStack {
-                    if let painting = currentPainting, painting.settings.frameFound {
-                        let keeps = library.keepsFrame(painting)
-                        Button {
-                            library.setKeepFrame(!keeps, for: painting.id)
-                        } label: {
-                            Label(keeps ? "Remove frame" : "Show frame", systemImage: keeps ? "crop" : "square.dashed")
-                                .font(.subheadline)
-                        }
-                        .buttonStyle(.bordered)
-                        .tint(.white)
-                    }
-                    Spacer()
-                    Button { dismiss() } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.title)
-                            .symbolRenderingMode(.hierarchical)
-                            .foregroundStyle(.white)
-                    }
-                }
-                .padding()
-                .transition(.opacity)
+                controls.transition(.opacity)
             }
         }
+        #if os(iOS)
         .statusBarHidden()
+        #else
+        .focusable()
+        .focusEffectDisabled()
+        .onKeyPress(.leftArrow) { step(-1); return .handled }
+        .onKeyPress(.rightArrow) { step(1); return .handled }
+        .onKeyPress(.escape) { close(); return .handled }
+        .onKeyPress(.space) { toggleLabel(); return .handled }
+        #endif
+    }
+
+    #if os(iOS)
+    /// Swipe between paintings.
+    private var pages: some View {
+        TabView(selection: $current) {
+            ForEach(library.paintings) { painting in
+                PaintingPage(painting: painting, showLabel: showLabel, toggleLabel: toggleLabel)
+                    .tag(painting.id)
+            }
+        }
+        .tabViewStyle(.page(indexDisplayMode: .never))
+        .ignoresSafeArea()
+    }
+    #else
+    /// One painting at a time; arrow keys or the side buttons move through the gallery.
+    private var pages: some View {
+        ZStack {
+            if let painting = currentPainting {
+                PaintingPage(painting: painting, showLabel: showLabel, toggleLabel: toggleLabel)
+                    .id(painting.id)
+            }
+            if showLabel {
+                HStack {
+                    Button { step(-1) } label: { Image(systemName: "chevron.left") }
+                        .disabled(index == 0)
+                    Spacer()
+                    Button { step(1) } label: { Image(systemName: "chevron.right") }
+                        .disabled(index == nil || index == library.paintings.count - 1)
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 34, weight: .light))
+                .foregroundStyle(.white.opacity(0.8))
+                .padding(.horizontal, 20)
+            }
+        }
+    }
+
+    private var index: Int? { library.paintings.firstIndex { $0.id == current } }
+
+    private func step(_ delta: Int) {
+        guard let i = index else { return }
+        let next = i + delta
+        guard library.paintings.indices.contains(next) else { return }
+        current = library.paintings[next].id
+    }
+    #endif
+
+    private var controls: some View {
+        HStack {
+            if let painting = currentPainting, painting.settings.frameFound {
+                let keeps = library.keepsFrame(painting)
+                Button {
+                    library.setKeepFrame(!keeps, for: painting.id)
+                } label: {
+                    Label(keeps ? "Remove frame" : "Show frame", systemImage: keeps ? "crop" : "square.dashed")
+                        .font(.subheadline)
+                }
+                .buttonStyle(.bordered)
+                .tint(.white)
+            }
+            Spacer()
+            Button(action: close) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.title)
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(.white)
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut(.cancelAction)
+        }
+        .padding()
     }
 }
 
@@ -219,7 +345,7 @@ struct PaintingPage: View {
     let showLabel: Bool
     let toggleLabel: () -> Void
 
-    @State private var image: UIImage?
+    @State private var image: CGImage?
     @State private var zoomed = false
 
     var body: some View {
@@ -283,6 +409,7 @@ struct WallLabel: View {
             parts.append("light colour corrected \(Int((s.lightStrength * 100).rounded()))%")
         }
         if s.unevenLightFixed { parts.append("spotlight evened") }
+        if painting.photosRecipe != nil { parts.append("saved to Photos") }
         if keepsFrame != s.keptFrame { parts.append("updating…") }
         return parts.joined(separator: " · ")
     }
@@ -290,10 +417,11 @@ struct WallLabel: View {
 
 // MARK: Zooming
 
+#if os(iOS)
 /// Pinch and double-tap zoom backed by UIScrollView. When the painting isn't zoomed, or a pan
 /// reaches its edge, the swipe passes to the exhibit so you move to the next painting.
 struct ZoomableImage: UIViewRepresentable {
-    let image: UIImage
+    let image: CGImage
     var onTap: () -> Void
     var onZoomChange: (Bool) -> Void
 
@@ -302,7 +430,7 @@ struct ZoomableImage: UIViewRepresentable {
     func makeUIView(context: Context) -> ZoomingScrollView {
         let view = ZoomingScrollView()
         view.delegate = context.coordinator
-        view.image = image
+        view.cgImage = image
 
         let doubleTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.doubleTapped(_:)))
         doubleTap.numberOfTapsRequired = 2
@@ -315,7 +443,7 @@ struct ZoomableImage: UIViewRepresentable {
 
     func updateUIView(_ view: ZoomingScrollView, context: Context) {
         context.coordinator.parent = self
-        if view.image !== image { view.image = image }
+        if view.cgImage !== image { view.cgImage = image }
     }
 
     final class Coordinator: NSObject, UIScrollViewDelegate {
@@ -360,10 +488,9 @@ final class ZoomingScrollView: UIScrollView {
     private let margin: CGFloat = 24
     private var laidOutSize: CGSize = .zero
 
-    var image: UIImage? {
-        get { imageView.image }
-        set {
-            imageView.image = newValue
+    var cgImage: CGImage? {
+        didSet {
+            imageView.image = cgImage.map { UIImage(cgImage: $0) }
             laidOutSize = .zero
             setNeedsLayout()
         }
@@ -413,12 +540,141 @@ final class ZoomingScrollView: UIScrollView {
         if contentInset != insets { contentInset = insets }
     }
 }
+#else
+/// Trackpad pinch, scroll and double-click zoom backed by NSScrollView. A single click shows or hides the label.
+struct ZoomableImage: NSViewRepresentable {
+    let image: CGImage
+    var onTap: () -> Void
+    var onZoomChange: (Bool) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
+
+    func makeNSView(context: Context) -> FittingScrollView {
+        let view = FittingScrollView()
+        view.cgImage = image
+        view.onMagnify = { [weak coordinator = context.coordinator] in coordinator?.magnificationChanged($0) }
+
+        let doubleClick = NSClickGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.doubleClicked(_:)))
+        doubleClick.numberOfClicksRequired = 2
+        let click = NSClickGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.clicked))
+        click.delegate = context.coordinator
+        context.coordinator.doubleClick = doubleClick
+        view.addGestureRecognizer(doubleClick)
+        view.addGestureRecognizer(click)
+        return view
+    }
+
+    func updateNSView(_ view: FittingScrollView, context: Context) {
+        context.coordinator.parent = self
+        if view.cgImage !== image { view.cgImage = image }
+    }
+
+    final class Coordinator: NSObject, NSGestureRecognizerDelegate {
+        var parent: ZoomableImage
+        weak var doubleClick: NSClickGestureRecognizer?
+        private var wasZoomed = false
+
+        init(parent: ZoomableImage) { self.parent = parent }
+
+        func magnificationChanged(_ magnification: CGFloat) {
+            let zoomed = magnification > 1.01
+            if zoomed != wasZoomed {
+                wasZoomed = zoomed
+                let report = parent.onZoomChange
+                DispatchQueue.main.async { report(zoomed) }
+            }
+        }
+
+        @objc func clicked() { parent.onTap() }
+
+        @objc func doubleClicked(_ gesture: NSClickGestureRecognizer) {
+            guard let view = gesture.view as? FittingScrollView, let doc = view.documentView else { return }
+            if view.magnification > 1.01 {
+                view.animator().magnification = 1
+                magnificationChanged(1)
+            } else {
+                let point = gesture.location(in: doc)
+                view.animator().setMagnification(2.5, centeredAt: point)
+                magnificationChanged(2.5)
+            }
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: NSGestureRecognizer,
+                               shouldRequireFailureOf other: NSGestureRecognizer) -> Bool {
+            other === doubleClick
+        }
+    }
+}
+
+final class FittingScrollView: NSScrollView {
+    private let imageView = NSImageView()
+    private let margin: CGFloat = 24
+    private var laidOutSize: CGSize = .zero
+    var onMagnify: ((CGFloat) -> Void)?
+
+    var cgImage: CGImage? {
+        didSet {
+            imageView.image = cgImage.map { NSImage(cgImage: $0, size: NSSize(width: $0.width, height: $0.height)) }
+            laidOutSize = .zero
+            needsLayout = true
+        }
+    }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        contentView = CenteringClipView()
+        drawsBackground = false
+        hasHorizontalScroller = true
+        hasVerticalScroller = true
+        autohidesScrollers = true
+        scrollerStyle = .overlay
+        allowsMagnification = true
+        minMagnification = 1
+        maxMagnification = 6
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        documentView = imageView
+        NotificationCenter.default.addObserver(forName: NSScrollView.didEndLiveMagnifyNotification, object: self, queue: .main) {
+            [weak self] _ in
+            guard let self else { return }
+            self.onMagnify?(self.magnification)
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+    override func layout() {
+        super.layout()
+        guard let image = cgImage, bounds.width > 0, bounds.height > 0 else { return }
+        if bounds.size != laidOutSize {
+            // First layout, a new image or a window resize: fit the painting with a margin.
+            laidOutSize = bounds.size
+            magnification = 1
+            onMagnify?(1)
+            let available = CGSize(width: max(1, bounds.width - 2 * margin), height: max(1, bounds.height - 2 * margin))
+            let w = CGFloat(image.width), h = CGFloat(image.height)
+            let fit = min(available.width / w, available.height / h)
+            imageView.frame = CGRect(x: 0, y: 0, width: w * fit, height: h * fit)
+        }
+    }
+}
+
+/// Keeps the document centred while it is smaller than the view.
+final class CenteringClipView: NSClipView {
+    override func constrainBoundsRect(_ proposedBounds: NSRect) -> NSRect {
+        var rect = super.constrainBoundsRect(proposedBounds)
+        guard let doc = documentView else { return rect }
+        if rect.width > doc.frame.width { rect.origin.x = (doc.frame.width - rect.width) / 2 }
+        if rect.height > doc.frame.height { rect.origin.y = (doc.frame.height - rect.height) / 2 }
+        return rect
+    }
+}
+#endif
 
 // MARK: Image loading
 
 enum ImageLoader {
     /// Loads a downscaled image from disk off the main thread.
-    static func load(_ url: URL, maxPixel: Int) async -> UIImage? {
+    static func load(_ url: URL, maxPixel: Int) async -> CGImage? {
         await Task.detached(priority: .userInitiated) {
             guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary) else {
                 return nil
@@ -429,8 +685,7 @@ enum ImageLoader {
                 kCGImageSourceShouldCacheImmediately: true,
                 kCGImageSourceThumbnailMaxPixelSize: maxPixel
             ]
-            guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
-            return UIImage(cgImage: cg)
+            return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
         }.value
     }
 }

@@ -6,3 +6,4 @@ xcuserdata/
 .swiftpm/xcode/xcuserdata/
 PaintingExhibit.swiftpm/.swiftpm/xcode/xcuserdata/
 PaintingExhibit.swiftpm/.build/
+build/

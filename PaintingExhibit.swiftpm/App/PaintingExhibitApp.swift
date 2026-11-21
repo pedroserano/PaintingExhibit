@@ -10,6 +10,9 @@ struct PaintingExhibitApp: App {
             ContentView()
                 .environmentObject(library)
                 .preferredColorScheme(.dark)
+                #if os(macOS)
+                .frame(minWidth: 640, minHeight: 480)
+                #endif
         }
         .onChange(of: scenePhase) { _, phase in
             // Catch anything added to the album while the app was in the background.
@@ -17,5 +20,13 @@ struct PaintingExhibitApp: App {
                 Task { await library.processNew() }
             }
         }
+
+        #if os(macOS)
+        Settings {
+            SettingsView()
+                .environmentObject(library)
+                .frame(width: 460)
+        }
+        #endif
     }
 }

@@ -92,15 +92,22 @@ enum PaintingProcessor {
     }
 
     /// Draws the painting from the original photo with an existing recipe (no detection).
-    static func render(imageData: Data, settings: ProcessingSettings, writeTo url: URL) throws -> ProcessingSettings {
-        let (base, _) = try prepare(imageData)
+    /// The recipe's corners are relative to the photo, so it can be drawn at any size:
+    /// `maxDimension` caps the photo's long side before cropping (larger for edits saved to Photos).
+    static func render(
+        imageData: Data,
+        settings: ProcessingSettings,
+        maxDimension: CGFloat = PaintingProcessor.maxDimension,
+        writeTo url: URL
+    ) throws -> ProcessingSettings {
+        let (base, _) = try prepare(imageData, maxDimension: maxDimension)
         return try render(base: base, settings: settings, writeTo: url)
     }
 
     // MARK: Preparing the photo
 
     /// Loads the photo, applies its orientation and scales it to the working size.
-    private static func prepare(_ imageData: Data) throws -> (CIImage, CGImage) {
+    private static func prepare(_ imageData: Data, maxDimension: CGFloat = PaintingProcessor.maxDimension) throws -> (CIImage, CGImage) {
         guard var image = CIImage(data: imageData, options: [.applyOrientationProperty: true]) else {
             throw ProcessingError.noImage
         }
