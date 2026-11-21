@@ -37,7 +37,10 @@ Your paintings and frame choices are kept.
 
 ## What phase 1 does
 
-- Finds the painting's edges and straightens it; looks for the canvas inside the frame and drops the frame.
+- Finds the painting's edges and straightens it, restoring its true proportions when it was photographed
+  from one side, above or below (from the corners and the lens's focal length). Looks for the canvas inside
+  the frame and drops the frame, including in close-ups where the frame runs off the photo's edges.
+  Lens distortion (fish-eye) isn't corrected; iPhone photos have it removed by the camera.
   **Show frames** in Settings sets the default; **Show frame / Remove frame** on a painting overrides it.
 - Samples the wall on all four sides of the frame:
   - its colour sets the white balance (skipped when the wall itself is clearly coloured, e.g. a red gallery);
