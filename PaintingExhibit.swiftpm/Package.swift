@@ -19,6 +19,7 @@ let package = Package(
             bundleIdentifier: "com.pedroserano.PaintingExhibit",
             displayVersion: "0.1",
             bundleVersion: "1",
+            appIcon: .asset("AppIcon"),
             accentColor: .presetColor(.orange),
             supportedDeviceFamilies: [
                 .pad,
@@ -31,7 +32,7 @@ let package = Package(
                 .portraitUpsideDown(.when(deviceFamilies: [.pad]))
             ],
             capabilities: [
-                .photoLibrary(purposeString: "Painting Exhibit reads the paintings album you choose so it can crop, correct and display each painting. It never changes or deletes your photos.")
+                .photoLibrary(purposeString: "Painting Exhibit reads the paintings album you choose so it can crop, correct and display each painting. It changes photos only if you turn on Save Edits to Photos, and Photos keeps the originals.")
             ]
         )
     ],

@@ -6,6 +6,8 @@
 	<string>PaintingExhibit</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.pedroserano.PaintingExhibit</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleName</key>
 	<string>Painting Exhibit</string>
 	<key>CFBundleDisplayName</key>

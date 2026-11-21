@@ -68,6 +68,10 @@ batch of changes. Revert to Original also removes any edits made in Photos befor
 The app always works from the image underneath its own edit, so its edits never pile up. If a photo is
 edited again elsewhere after the app saved its edit, the app leaves that photo alone from then on.
 
+## Icon
+
+Drawn in code by `scripts/make-icon.swift`; run `swift scripts/make-icon.swift` to redraw it for both apps.
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE).

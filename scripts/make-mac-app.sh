@@ -10,7 +10,8 @@ BIN="$(swift build -c release --show-bin-path)"
 
 APP="build/Painting Exhibit.app"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp Mac/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 cp "$BIN/PaintingExhibit" "$APP/Contents/MacOS/PaintingExhibit"
 cp Mac/Info.plist "$APP/Contents/Info.plist"
 

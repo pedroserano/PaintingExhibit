@@ -10,6 +10,7 @@ let package = Package(
     name: "PaintingExhibitMac",
     platforms: [.macOS("14.0")],
     targets: [
-        .executableTarget(name: "PaintingExhibit", path: "PaintingExhibit.swiftpm/App")
+        .executableTarget(name: "PaintingExhibit", path: "PaintingExhibit.swiftpm/App",
+                         exclude: ["Assets.xcassets"]) // the Mac icon is Mac/AppIcon.icns
     ]
 )
