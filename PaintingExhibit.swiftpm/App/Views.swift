@@ -84,13 +84,13 @@ struct GalleryView: View {
             }
             if library.paintings.isEmpty && !library.isProcessing {
                 ContentUnavailableView("No paintings yet", systemImage: "photo.artframe",
-                                       description: Text("Add photos to the album, then pull down to refresh."))
+                                       description: Text("Add photos to the album and they'll appear here."))
                     .padding(.top, 80)
             }
             LazyVGrid(columns: columns, spacing: 12) {
                 ForEach(library.paintings) { painting in
                     Button { selected = painting } label: {
-                        Thumbnail(url: library.url(for: painting), version: painting.processedAt)
+                        Thumbnail(painting: painting)
                     }
                     .buttonStyle(.plain)
                 }
@@ -100,6 +100,10 @@ struct GalleryView: View {
         .navigationTitle(library.albumTitle ?? "Exhibit")
         .toolbar {
             Menu {
+                Toggle(isOn: $library.keepFramesByDefault) {
+                    Label("Show frames", systemImage: "square.dashed")
+                }
+                Divider()
                 Button("Check for new paintings", systemImage: "arrow.clockwise") {
                     Task { await library.processNew() }
                 }
@@ -124,8 +128,8 @@ struct GalleryView: View {
 }
 
 struct Thumbnail: View {
-    let url: URL
-    let version: Date
+    @EnvironmentObject var library: Library
+    let painting: Painting
     @State private var image: UIImage?
 
     var body: some View {
@@ -142,7 +146,10 @@ struct Thumbnail: View {
                 }
             }
             .clipShape(RoundedRectangle(cornerRadius: 6))
-            .task(id: version) { image = await ImageLoader.load(url, maxPixel: 450) }
+            .task(id: painting.renderedAt) {
+                guard let url = await library.imageURL(for: painting) else { return }
+                image = await ImageLoader.load(url, maxPixel: 450)
+            }
     }
 }
 
@@ -158,13 +165,17 @@ struct ExhibitView: View {
         _current = State(initialValue: startID)
     }
 
+    private var currentPainting: Painting? {
+        library.paintings.first { $0.id == current }
+    }
+
     var body: some View {
-        ZStack(alignment: .topTrailing) {
+        ZStack(alignment: .top) {
             Color.black.ignoresSafeArea()
 
             TabView(selection: $current) {
                 ForEach(library.paintings) { painting in
-                    PaintingPage(painting: painting, url: library.url(for: painting), showLabel: showLabel) {
+                    PaintingPage(painting: painting, showLabel: showLabel) {
                         withAnimation(.easeInOut(duration: 0.2)) { showLabel.toggle() }
                     }
                     .tag(painting.id)
@@ -174,11 +185,25 @@ struct ExhibitView: View {
             .ignoresSafeArea()
 
             if showLabel {
-                Button { dismiss() } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.title)
-                        .symbolRenderingMode(.hierarchical)
-                        .foregroundStyle(.white)
+                HStack {
+                    if let painting = currentPainting, painting.settings.frameFound {
+                        let keeps = library.keepsFrame(painting)
+                        Button {
+                            library.setKeepFrame(!keeps, for: painting.id)
+                        } label: {
+                            Label(keeps ? "Remove frame" : "Show frame", systemImage: keeps ? "crop" : "square.dashed")
+                                .font(.subheadline)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(.white)
+                    }
+                    Spacer()
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.title)
+                            .symbolRenderingMode(.hierarchical)
+                            .foregroundStyle(.white)
+                    }
                 }
                 .padding()
                 .transition(.opacity)
@@ -189,60 +214,34 @@ struct ExhibitView: View {
 }
 
 struct PaintingPage: View {
+    @EnvironmentObject var library: Library
     let painting: Painting
-    let url: URL
     let showLabel: Bool
     let toggleLabel: () -> Void
 
     @State private var image: UIImage?
-    @State private var scale: CGFloat = 1
-    @State private var offset: CGSize = .zero
-    @GestureState private var pinch: CGFloat = 1
-    @GestureState private var drag: CGSize = .zero
+    @State private var zoomed = false
 
     var body: some View {
         ZStack(alignment: .bottom) {
             if let image {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .padding(24)
-                    .scaleEffect(scale * pinch)
-                    .offset(x: offset.width + drag.width, y: offset.height + drag.height)
-                    .gesture(
-                        MagnifyGesture()
-                            .updating($pinch) { value, state, _ in state = value.magnification }
-                            .onEnded { value in
-                                scale = min(max(scale * value.magnification, 1), 6)
-                                if scale == 1 { offset = .zero }
-                            }
-                    )
-                    .simultaneousGesture(scale > 1 ? panGesture : nil)
-                    .onTapGesture(count: 2) {
-                        withAnimation { scale = scale > 1 ? 1 : 2.5; offset = .zero }
-                    }
-                    .onTapGesture { toggleLabel() }
+                ZoomableImage(image: image, onTap: toggleLabel, onZoomChange: { zoomed = $0 })
+                    .ignoresSafeArea()
             } else {
                 ProgressView()
             }
 
-            if showLabel && scale == 1 {
-                WallLabel(painting: painting)
+            if showLabel && !zoomed {
+                WallLabel(painting: painting, keepsFrame: library.keepsFrame(painting))
                     .padding(.bottom, 32)
                     .transition(.opacity)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .task(id: painting.processedAt) { image = await ImageLoader.load(url, maxPixel: 3000) }
-    }
-
-    private var panGesture: some Gesture {
-        DragGesture()
-            .updating($drag) { value, state, _ in state = value.translation }
-            .onEnded { value in
-                offset.width += value.translation.width
-                offset.height += value.translation.height
-            }
+        .task(id: painting.renderedAt) {
+            guard let url = await library.imageURL(for: painting) else { return }
+            image = await ImageLoader.load(url, maxPixel: 3000)
+        }
     }
 }
 
@@ -250,6 +249,7 @@ struct PaintingPage: View {
 /// plus what the processing did, to help tune the results.
 struct WallLabel: View {
     let painting: Painting
+    let keepsFrame: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -271,14 +271,146 @@ struct WallLabel: View {
     }
 
     private var processingSummary: String {
+        let s = painting.settings
         var parts: [String] = []
-        parts.append(painting.cropFound ? "cropped" : "no edges found")
-        if painting.frameRemoved { parts.append("frame removed") }
-        if painting.cropFound {
-            parts.append("light colour corrected \(Int((painting.lightCorrection * 100).rounded()))%")
+        parts.append(s.cropFound ? "cropped" : "no edges found")
+        if s.frameFound {
+            parts.append(s.keptFrame ? "frame kept" : "frame removed")
+        } else if s.cropFound {
+            parts.append("no frame found")
         }
-        if painting.unevenLightFixed { parts.append("spotlight evened") }
+        if s.cropFound {
+            parts.append("light colour corrected \(Int((s.lightStrength * 100).rounded()))%")
+        }
+        if s.unevenLightFixed { parts.append("spotlight evened") }
+        if keepsFrame != s.keptFrame { parts.append("updating…") }
         return parts.joined(separator: " · ")
+    }
+}
+
+// MARK: Zooming
+
+/// Pinch and double-tap zoom backed by UIScrollView. When the painting isn't zoomed, or a pan
+/// reaches its edge, the swipe passes to the exhibit so you move to the next painting.
+struct ZoomableImage: UIViewRepresentable {
+    let image: UIImage
+    var onTap: () -> Void
+    var onZoomChange: (Bool) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
+
+    func makeUIView(context: Context) -> ZoomingScrollView {
+        let view = ZoomingScrollView()
+        view.delegate = context.coordinator
+        view.image = image
+
+        let doubleTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.doubleTapped(_:)))
+        doubleTap.numberOfTapsRequired = 2
+        let singleTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.singleTapped))
+        singleTap.require(toFail: doubleTap)
+        view.addGestureRecognizer(doubleTap)
+        view.addGestureRecognizer(singleTap)
+        return view
+    }
+
+    func updateUIView(_ view: ZoomingScrollView, context: Context) {
+        context.coordinator.parent = self
+        if view.image !== image { view.image = image }
+    }
+
+    final class Coordinator: NSObject, UIScrollViewDelegate {
+        var parent: ZoomableImage
+        private var wasZoomed = false
+
+        init(parent: ZoomableImage) { self.parent = parent }
+
+        func viewForZooming(in scrollView: UIScrollView) -> UIView? {
+            (scrollView as? ZoomingScrollView)?.imageView
+        }
+
+        func scrollViewDidZoom(_ scrollView: UIScrollView) {
+            (scrollView as? ZoomingScrollView)?.centerContent()
+            let zoomed = scrollView.zoomScale > scrollView.minimumZoomScale + 0.01
+            if zoomed != wasZoomed {
+                wasZoomed = zoomed
+                let report = parent.onZoomChange
+                DispatchQueue.main.async { report(zoomed) }
+            }
+        }
+
+        @objc func singleTapped() { parent.onTap() }
+
+        @objc func doubleTapped(_ gesture: UITapGestureRecognizer) {
+            guard let view = gesture.view as? ZoomingScrollView else { return }
+            if view.zoomScale > view.minimumZoomScale + 0.01 {
+                view.setZoomScale(view.minimumZoomScale, animated: true)
+            } else {
+                let point = gesture.location(in: view.imageView)
+                let scale: CGFloat = 2.5
+                let size = CGSize(width: view.bounds.width / scale, height: view.bounds.height / scale)
+                view.zoom(to: CGRect(x: point.x - size.width / 2, y: point.y - size.height / 2,
+                                     width: size.width, height: size.height), animated: true)
+            }
+        }
+    }
+}
+
+final class ZoomingScrollView: UIScrollView {
+    let imageView = UIImageView()
+    private let margin: CGFloat = 24
+    private var laidOutSize: CGSize = .zero
+
+    var image: UIImage? {
+        get { imageView.image }
+        set {
+            imageView.image = newValue
+            laidOutSize = .zero
+            setNeedsLayout()
+        }
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        showsHorizontalScrollIndicator = false
+        showsVerticalScrollIndicator = false
+        contentInsetAdjustmentBehavior = .never
+        decelerationRate = .fast
+        minimumZoomScale = 1
+        maximumZoomScale = 6
+        bouncesZoom = true
+        backgroundColor = .clear
+        imageView.contentMode = .scaleAspectFit
+        addSubview(imageView)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard let image = imageView.image, bounds.width > 0, bounds.height > 0,
+              image.size.width > 0, image.size.height > 0 else { return }
+        if bounds.size != laidOutSize {
+            // First layout, a new image or a rotation: fit the painting with a margin.
+            laidOutSize = bounds.size
+            zoomScale = minimumZoomScale
+            let available = CGSize(width: max(1, bounds.width - 2 * margin), height: max(1, bounds.height - 2 * margin))
+            let fit = min(available.width / image.size.width, available.height / image.size.height)
+            let size = CGSize(width: image.size.width * fit, height: image.size.height * fit)
+            imageView.frame = CGRect(origin: .zero, size: size)
+            contentSize = size
+            centerContent()
+            contentOffset = CGPoint(x: -contentInset.left, y: -contentInset.top)
+        } else {
+            centerContent()
+        }
+    }
+
+    /// Keeps the painting centred while it is smaller than the screen.
+    func centerContent() {
+        let dx = max(0, (bounds.width - contentSize.width) / 2)
+        let dy = max(0, (bounds.height - contentSize.height) / 2)
+        let insets = UIEdgeInsets(top: dy, left: dx, bottom: dy, right: dx)
+        if contentInset != insets { contentInset = insets }
     }
 }
 

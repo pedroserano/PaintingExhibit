@@ -17,24 +17,60 @@ enum ProcessingError: LocalizedError {
     }
 }
 
-struct ProcessingResult {
-    var cropFound: Bool
-    var frameRemoved: Bool
-    var lightCorrection: Double
-    var unevenLightFixed: Bool
+/// A point in normalized image coordinates (0...1, bottom-left origin, as Vision and Core Image use).
+struct NormPoint: Codable, Hashable {
+    var x: Double
+    var y: Double
+}
+
+/// The non-destructive edit recipe for one painting. The photo in Photos is never changed;
+/// the exhibit image is drawn from the original with these values, and can be redrawn at any time.
+struct ProcessingSettings: Codable, Hashable {
+    /// The painting (outer frame edge) in the photo: top-left, top-right, bottom-right, bottom-left.
+    var paintingQuad: [NormPoint]?
+    /// The canvas inside the frame, in the flattened painting. Nil when no frame was found.
+    var canvasQuad: [NormPoint]?
+    /// Whether the frame is shown (canvasQuad is then not applied).
+    var keptFrame: Bool
+
+    /// Linear-light wall colour just outside each side of the frame.
+    var wallLeft: SIMD3<Float>?
+    var wallRight: SIMD3<Float>?
+    var wallTop: SIMD3<Float>?
+    var wallBottom: SIMD3<Float>?
+
+    /// How far the wall was trusted as a neutral reference (0...1).
+    var lightStrength: Float
+    var whiteBalance: SIMD3<Float>
+    var gainLeft: Float
+    var gainRight: Float
+    var gainTop: Float
+    var gainBottom: Float
+
+    /// Exposure, computed on first render. Nil means "work it out again" (e.g. after the frame choice changes).
+    var blackPoint: Float?
+    var exposure: Float?
+
+    var cropFound: Bool { paintingQuad != nil }
+    var frameFound: Bool { canvasQuad != nil }
+    var frameRemoved: Bool { frameFound && !keptFrame }
+    var unevenLightFixed: Bool { [gainLeft, gainRight, gainTop, gainBottom].contains { abs($0 - 1) > 0.005 } }
 }
 
 /// Crops a painting out of a museum photo and corrects its lighting,
 /// using the wall around the painting as the reference.
 ///
-/// Steps:
+/// `analyze` works out the recipe (`ProcessingSettings`); `render` draws the painting from
+/// the original photo with a recipe. Nothing is ever written back to Photos.
+///
+/// Analysis:
 /// 1. Find the painting (frame) as a rectangle and flatten its perspective.
-/// 2. Look inside that for the canvas edge, to drop the frame.
+/// 2. Look inside that for the canvas edge, so the frame can be dropped.
 /// 3. Sample the wall just outside the frame on each side:
 ///    - its average colour gives the colour of the light (white balance),
 ///    - the difference between sides gives the spotlight falloff.
-/// 4. Apply the white balance and the inverse falloff to the canvas,
-///    then gently set exposure from the painting's own brightness range.
+/// Rendering applies the white balance and the inverse falloff to the canvas,
+/// then gently sets exposure from the painting's own brightness range.
 enum PaintingProcessor {
     static let maxDimension: CGFloat = 2400
 
@@ -45,8 +81,26 @@ enum PaintingProcessor {
         .cacheIntermediates: false
     ])
 
-    static func process(imageData: Data, writeTo url: URL) throws -> ProcessingResult {
-        // Load, apply the photo's orientation, and scale down.
+    // MARK: Entry points
+
+    /// Works out the recipe for a photo, draws the painting with it and writes the image to `url`.
+    /// Returns the recipe, with the exposure it settled on filled in.
+    static func analyzeAndRender(imageData: Data, keepFrame: Bool, writeTo url: URL) throws -> ProcessingSettings {
+        let (base, baseCG) = try prepare(imageData)
+        let settings = analyze(base: base, baseCG: baseCG, keepFrame: keepFrame)
+        return try render(base: base, settings: settings, writeTo: url)
+    }
+
+    /// Draws the painting from the original photo with an existing recipe (no detection).
+    static func render(imageData: Data, settings: ProcessingSettings, writeTo url: URL) throws -> ProcessingSettings {
+        let (base, _) = try prepare(imageData)
+        return try render(base: base, settings: settings, writeTo: url)
+    }
+
+    // MARK: Preparing the photo
+
+    /// Loads the photo, applies its orientation and scales it to the working size.
+    private static func prepare(_ imageData: Data) throws -> (CIImage, CGImage) {
         guard var image = CIImage(data: imageData, options: [.applyOrientationProperty: true]) else {
             throw ProcessingError.noImage
         }
@@ -60,84 +114,100 @@ enum PaintingProcessor {
         guard let baseCG = context.createCGImage(image, from: image.extent.integral, format: .RGBA8, colorSpace: sRGB) else {
             throw ProcessingError.renderFailed
         }
-        let base = CIImage(cgImage: baseCG)
+        return (CIImage(cgImage: baseCG), baseCG)
+    }
 
-        var result = ProcessingResult(cropFound: false, frameRemoved: false, lightCorrection: 0, unevenLightFixed: false)
+    // MARK: Analysis
+
+    private static func analyze(base: CIImage, baseCG: CGImage, keepFrame: Bool) -> ProcessingSettings {
+        var settings = ProcessingSettings(
+            paintingQuad: nil, canvasQuad: nil, keptFrame: keepFrame,
+            lightStrength: 0, whiteBalance: SIMD3(1, 1, 1),
+            gainLeft: 1, gainRight: 1, gainTop: 1, gainBottom: 1
+        )
 
         // 1. Find the painting.
-        var painting = base
-        var wall: WallSample?
-        if let quad = largestQuad(in: baseCG, minimumSize: 0.2, accept: { area, _ in area >= 0.08 }) {
-            result.cropFound = true
-            wall = sampleWall(around: quad, in: base)
-            painting = flatten(base, quad: quad)
-
-            // 2. Look for the canvas inside the frame.
-            if let flatCG = context.createCGImage(painting, from: painting.extent.integral, format: .RGBA8, colorSpace: sRGB),
-               let inner = largestQuad(in: flatCG, minimumSize: 0.5, accept: { area, center in
-                   area > 0.45 && area < 0.97 && abs(center.x - 0.5) < 0.1 && abs(center.y - 0.5) < 0.1
-               }) {
-                painting = flatten(painting, quad: inner)
-                result.frameRemoved = true
-            }
+        guard let quad = largestQuad(in: baseCG, minimumSize: 0.2, accept: { area, _ in area >= 0.08 }) else {
+            return settings
         }
+        settings.paintingQuad = quad
+        let wall = sampleWall(around: quad, in: base)
+        settings.wallLeft = wall.left
+        settings.wallRight = wall.right
+        settings.wallTop = wall.top
+        settings.wallBottom = wall.bottom
 
-        guard let paintingCG = context.createCGImage(painting, from: painting.extent.integral, format: .RGBA8, colorSpace: sRGB) else {
-            throw ProcessingError.renderFailed
+        // 2. Look for the canvas inside the frame (always, so the frame choice can change later).
+        let flat = flatten(base, quad: quad)
+        if let flatCG = context.createCGImage(flat, from: flat.extent.integral, format: .RGBA8, colorSpace: sRGB) {
+            settings.canvasQuad = largestQuad(in: flatCG, minimumSize: 0.5, accept: { area, center in
+                area > 0.45 && area < 0.97 && abs(center.x - 0.5) < 0.1 && abs(center.y - 0.5) < 0.1
+            })
         }
 
         // 3. Work out the corrections from the wall.
-        var whiteBalance = SIMD3<Float>(1, 1, 1)
-        var gainLeft: Float = 1, gainRight: Float = 1, gainTop: Float = 1, gainBottom: Float = 1
-
-        if let wall, let average = wall.average {
+        if let average = wall.average {
             let strength = lightStrength(for: average)
-            result.lightCorrection = Double(strength)
+            settings.lightStrength = strength
             let luminance = (average.x + average.y + average.z) / 3
             for c in 0..<3 {
                 let full = clamp(luminance / max(average[c], 0.0001), 0.5, 2.2)
-                whiteBalance[c] = 1 + (full - 1) * strength
+                settings.whiteBalance[c] = 1 + (full - 1) * strength
             }
 
             // Spotlight falloff: brighten the side of the canvas next to the darker wall.
             if let l = wall.left, let r = wall.right {
                 let ll = l.sum / 3, lr = r.sum / 3, mean = (ll + lr) / 2
-                gainLeft = clamp(mean / max(ll, 0.0001), 0.75, 1.33)
-                gainRight = clamp(mean / max(lr, 0.0001), 0.75, 1.33)
-                result.unevenLightFixed = true
+                settings.gainLeft = clamp(mean / max(ll, 0.0001), 0.75, 1.33)
+                settings.gainRight = clamp(mean / max(lr, 0.0001), 0.75, 1.33)
             }
             if let t = wall.top, let b = wall.bottom {
                 let lt = t.sum / 3, lb = b.sum / 3, mean = (lt + lb) / 2
-                gainTop = clamp(mean / max(lt, 0.0001), 0.75, 1.33)
-                gainBottom = clamp(mean / max(lb, 0.0001), 0.75, 1.33)
-                result.unevenLightFixed = true
+                settings.gainTop = clamp(mean / max(lt, 0.0001), 0.75, 1.33)
+                settings.gainBottom = clamp(mean / max(lb, 0.0001), 0.75, 1.33)
             }
         }
+        return settings
+    }
 
-        // 4. Apply.
-        let output = try applyCorrections(
-            to: paintingCG,
-            whiteBalance: whiteBalance,
-            gainLeft: gainLeft, gainRight: gainRight,
-            gainTop: gainTop, gainBottom: gainBottom
-        )
+    // MARK: Rendering
 
-        guard let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else {
+    private static func render(base: CIImage, settings: ProcessingSettings, writeTo url: URL) throws -> ProcessingSettings {
+        var settings = settings
+        var painting = base
+        if let quad = settings.paintingQuad {
+            painting = flatten(painting, quad: quad)
+            if let inner = settings.canvasQuad, !settings.keptFrame {
+                painting = flatten(painting, quad: inner)
+            }
+        }
+        guard let paintingCG = context.createCGImage(painting, from: painting.extent.integral, format: .RGBA8, colorSpace: sRGB) else {
+            throw ProcessingError.renderFailed
+        }
+
+        let output = try applyCorrections(to: paintingCG, settings: &settings)
+
+        // Write to a temporary file first, so a half-written image is never shown.
+        let tmp = url.deletingLastPathComponent().appendingPathComponent(UUID().uuidString + ".tmp")
+        guard let destination = CGImageDestinationCreateWithURL(tmp as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else {
             throw ProcessingError.writeFailed
         }
         CGImageDestinationAddImage(destination, output, [kCGImageDestinationLossyCompressionQuality: 0.92] as CFDictionary)
         guard CGImageDestinationFinalize(destination) else { throw ProcessingError.writeFailed }
-        return result
+        _ = try? FileManager.default.removeItem(at: url)
+        try FileManager.default.moveItem(at: tmp, to: url)
+        return settings
     }
 
     // MARK: Finding the painting
 
-    /// The largest rectangle Vision finds that passes `accept(area, center)`, in normalized coordinates.
+    /// The largest rectangle Vision finds that passes `accept(area, center)`, in normalized coordinates,
+    /// as top-left, top-right, bottom-right, bottom-left.
     private static func largestQuad(
         in image: CGImage,
         minimumSize: Float,
         accept: (CGFloat, CGPoint) -> Bool
-    ) -> VNRectangleObservation? {
+    ) -> [NormPoint]? {
         let request = VNDetectRectanglesRequest()
         request.minimumAspectRatio = 0.15
         request.maximumAspectRatio = 1.0
@@ -150,38 +220,44 @@ enum PaintingProcessor {
         } catch {
             return nil
         }
-        let candidates = (request.results ?? []).filter { accept(area(of: $0), center(of: $0)) }
-        return candidates.max { area(of: $0) < area(of: $1) }
+        let quads = (request.results ?? []).map { o in
+            [o.topLeft, o.topRight, o.bottomRight, o.bottomLeft].map { NormPoint(x: Double($0.x), y: Double($0.y)) }
+        }
+        return quads
+            .filter { accept(area(of: $0), center(of: $0)) }
+            .max { area(of: $0) < area(of: $1) }
     }
 
-    private static func area(of quad: VNRectangleObservation) -> CGFloat {
-        let p = [quad.topLeft, quad.topRight, quad.bottomRight, quad.bottomLeft]
-        var sum: CGFloat = 0
+    private static func area(of quad: [NormPoint]) -> CGFloat {
+        var sum: Double = 0
         for i in 0..<4 {
-            let a = p[i], b = p[(i + 1) % 4]
+            let a = quad[i], b = quad[(i + 1) % 4]
             sum += a.x * b.y - b.x * a.y
         }
-        return abs(sum) / 2
+        return CGFloat(abs(sum) / 2)
     }
 
-    private static func center(of quad: VNRectangleObservation) -> CGPoint {
-        CGPoint(
-            x: (quad.topLeft.x + quad.topRight.x + quad.bottomLeft.x + quad.bottomRight.x) / 4,
-            y: (quad.topLeft.y + quad.topRight.y + quad.bottomLeft.y + quad.bottomRight.y) / 4
-        )
+    private static func center(of quad: [NormPoint]) -> CGPoint {
+        CGPoint(x: quad.map(\.x).reduce(0, +) / 4, y: quad.map(\.y).reduce(0, +) / 4)
+    }
+
+    private static func boundingBox(of quad: [NormPoint]) -> CGRect {
+        let xs = quad.map(\.x), ys = quad.map(\.y)
+        let minX = xs.min() ?? 0, maxX = xs.max() ?? 1, minY = ys.min() ?? 0, maxY = ys.max() ?? 1
+        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
     }
 
     /// Straightens the quad into a flat rectangle. Vision and Core Image both use a bottom-left origin.
-    private static func flatten(_ image: CIImage, quad: VNRectangleObservation) -> CIImage {
+    private static func flatten(_ image: CIImage, quad: [NormPoint]) -> CIImage {
         let e = image.extent
-        func point(_ n: CGPoint) -> CIVector {
+        func point(_ n: NormPoint) -> CIVector {
             CIVector(cgPoint: CGPoint(x: e.minX + n.x * e.width, y: e.minY + n.y * e.height))
         }
         let flat = image.applyingFilter("CIPerspectiveCorrection", parameters: [
-            "inputTopLeft": point(quad.topLeft),
-            "inputTopRight": point(quad.topRight),
-            "inputBottomLeft": point(quad.bottomLeft),
-            "inputBottomRight": point(quad.bottomRight)
+            "inputTopLeft": point(quad[0]),
+            "inputTopRight": point(quad[1]),
+            "inputBottomRight": point(quad[2]),
+            "inputBottomLeft": point(quad[3])
         ])
         return flat.transformed(by: CGAffineTransform(translationX: -flat.extent.minX, y: -flat.extent.minY))
     }
@@ -202,13 +278,14 @@ enum PaintingProcessor {
     }
 
     /// Averages four strips of wall just outside the painting, leaving a small gap for the frame's shadow.
-    private static func sampleWall(around quad: VNRectangleObservation, in image: CIImage) -> WallSample {
+    private static func sampleWall(around quad: [NormPoint], in image: CIImage) -> WallSample {
         let e = image.extent
+        let bb = boundingBox(of: quad)
         let box = CGRect(
-            x: e.minX + quad.boundingBox.minX * e.width,
-            y: e.minY + quad.boundingBox.minY * e.height,
-            width: quad.boundingBox.width * e.width,
-            height: quad.boundingBox.height * e.height
+            x: e.minX + bb.minX * e.width,
+            y: e.minY + bb.minY * e.height,
+            width: bb.width * e.width,
+            height: bb.height * e.height
         )
         let m = 0.10 * max(box.width, box.height)
         let gap = 0.25 * m
@@ -245,12 +322,9 @@ enum PaintingProcessor {
 
     // MARK: Applying the corrections
 
-    private static func applyCorrections(
-        to image: CGImage,
-        whiteBalance: SIMD3<Float>,
-        gainLeft: Float, gainRight: Float,
-        gainTop: Float, gainBottom: Float
-    ) throws -> CGImage {
+    /// Applies white balance, spotlight gains and exposure. When the recipe has no exposure yet,
+    /// it is worked out from the painting's brightness range and stored back into `settings`.
+    private static func applyCorrections(to image: CGImage, settings: inout ProcessingSettings) throws -> CGImage {
         let w = image.width, h = image.height
         guard w > 1, h > 1,
               let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
@@ -273,43 +347,48 @@ enum PaintingProcessor {
         }
 
         // Spotlight correction per column and per row (row 0 is the top).
-        let colGain: [Float] = (0..<w).map { x in gainLeft + (gainRight - gainLeft) * Float(x) / Float(w - 1) }
-        let rowGain: [Float] = (0..<h).map { y in gainTop + (gainBottom - gainTop) * Float(y) / Float(h - 1) }
-        let wb = [whiteBalance.x, whiteBalance.y, whiteBalance.z]
+        let gl = settings.gainLeft, gr = settings.gainRight, gt = settings.gainTop, gb = settings.gainBottom
+        let colGain: [Float] = (0..<w).map { x in gl + (gr - gl) * Float(x) / Float(w - 1) }
+        let rowGain: [Float] = (0..<h).map { y in gt + (gb - gt) * Float(y) / Float(h - 1) }
+        let wb = [settings.whiteBalance.x, settings.whiteBalance.y, settings.whiteBalance.z]
 
-        // Pass 1: brightness range after colour and spotlight correction (sampled).
-        var histogram = [Int](repeating: 0, count: 1024)
-        let stride = max(1, (w * h) / 300_000)
-        toLinear.withUnsafeBufferPointer { lin in
-            var i = 0
-            while i < w * h {
-                let g = colGain[i % w] * rowGain[i / w]
-                let o = i * 4
-                let r = lin[Int(px[o])] * wb[0] * g
-                let gg = lin[Int(px[o + 1])] * wb[1] * g
-                let b = lin[Int(px[o + 2])] * wb[2] * g
-                let l = 0.2126 * r + 0.7152 * gg + 0.0722 * b
-                histogram[min(1023, max(0, Int(l * 1023)))] += 1
-                i += stride
+        if settings.blackPoint == nil || settings.exposure == nil {
+            // Brightness range after colour and spotlight correction (sampled).
+            var histogram = [Int](repeating: 0, count: 1024)
+            let stride = max(1, (w * h) / 300_000)
+            toLinear.withUnsafeBufferPointer { lin in
+                var i = 0
+                while i < w * h {
+                    let g = colGain[i % w] * rowGain[i / w]
+                    let o = i * 4
+                    let r = lin[Int(px[o])] * wb[0] * g
+                    let gg = lin[Int(px[o + 1])] * wb[1] * g
+                    let b = lin[Int(px[o + 2])] * wb[2] * g
+                    let l = 0.2126 * r + 0.7152 * gg + 0.0722 * b
+                    histogram[min(1023, max(0, Int(l * 1023)))] += 1
+                    i += stride
+                }
             }
-        }
-        let total = histogram.reduce(0, +)
-        func percentile(_ p: Float) -> Float {
-            let target = Int(Float(total) * p)
-            var running = 0
-            for (k, count) in histogram.enumerated() {
-                running += count
-                if running >= target { return Float(k) / 1023 }
+            let total = histogram.reduce(0, +)
+            func percentile(_ p: Float) -> Float {
+                let target = Int(Float(total) * p)
+                var running = 0
+                for (k, count) in histogram.enumerated() {
+                    running += count
+                    if running >= target { return Float(k) / 1023 }
+                }
+                return 1
             }
-            return 1
+            let low = percentile(0.003), high = percentile(0.997)
+
+            // Gentle exposure: lift only a little black, bring the brightest paint to about 95% (sRGB).
+            let black = min(low * 0.8, 0.02)
+            settings.blackPoint = black
+            settings.exposure = clamp(0.9 / max(high - black, 0.05), 0.8, 2.0)
         }
-        let low = percentile(0.003), high = percentile(0.997)
+        let black = settings.blackPoint ?? 0
+        let exposure = settings.exposure ?? 1
 
-        // Gentle exposure: lift only a little black, bring the brightest paint to about 95% (sRGB).
-        let black = min(low * 0.8, 0.02)
-        let exposure = clamp(0.9 / max(high - black, 0.05), 0.8, 2.0)
-
-        // Pass 2: apply everything.
         toLinear.withUnsafeBufferPointer { lin in
             toSRGB.withUnsafeBufferPointer { out in
                 let top = Float(lutSize - 1)
