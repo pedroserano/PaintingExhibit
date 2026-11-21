@@ -41,3 +41,7 @@ original in Photos with that recipe.
 Drawn images are kept in the app's cache so swiping is quick. iOS may clear the cache when space is short;
 they are then redrawn from Photos as you view them. If a photo's original is only in iCloud
 (Optimize iPhone Storage), redrawing it needs a connection.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).
