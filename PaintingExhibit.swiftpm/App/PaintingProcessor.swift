@@ -134,7 +134,8 @@ enum PaintingProcessor {
         )
 
         // 1. Find the painting.
-        guard let quad = largestQuad(in: baseCG, minimumSize: 0.2, accept: { area, _ in area >= 0.08 }) else {
+        guard let quad = largestQuad(in: baseCG, minimumSize: 0.2, accept: { area, _ in area >= 0.08 })
+                ?? documentQuad(in: baseCG) else {
             return settings
         }
         settings.paintingQuad = quad
@@ -145,12 +146,7 @@ enum PaintingProcessor {
         settings.wallBottom = wall.bottom
 
         // 2. Look for the canvas inside the frame (always, so the frame choice can change later).
-        let flat = flatten(base, quad: quad)
-        if let flatCG = context.createCGImage(flat, from: flat.extent.integral, format: .RGBA8, colorSpace: sRGB) {
-            settings.canvasQuad = largestQuad(in: flatCG, minimumSize: 0.5, accept: { area, center in
-                area > 0.45 && area < 0.97 && abs(center.x - 0.5) < 0.1 && abs(center.y - 0.5) < 0.1
-            })
-        }
+        settings.canvasQuad = findCanvas(in: flatten(base, quad: quad))
 
         // 3. Work out the corrections from the wall.
         if let average = wall.average {
@@ -233,6 +229,165 @@ enum PaintingProcessor {
         return quads
             .filter { accept(area(of: $0), center(of: $0)) }
             .max { area(of: $0) < area(of: $1) }
+    }
+
+    /// Vision's document finder, as a fallback when no rectangle stands out: it picks out the main
+    /// flat object in the photo, which for a photo of a painting is usually the painting in its frame.
+    private static func documentQuad(in image: CGImage) -> [NormPoint]? {
+        let request = VNDetectDocumentSegmentationRequest()
+        do {
+            try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+        } catch {
+            return nil
+        }
+        guard let o = request.results?.first, o.confidence >= 0.5 else { return nil }
+        let quad = [o.topLeft, o.topRight, o.bottomRight, o.bottomLeft].map { NormPoint(x: Double($0.x), y: Double($0.y)) }
+        return area(of: quad) >= 0.08 ? quad : nil
+    }
+
+    // MARK: Finding the canvas inside the frame
+
+    /// Finds the frame's inner edge on each side of the straightened painting: the innermost straight line
+    /// that runs the length of that side with a clear change of colour across it (a frame's mouldings, a mat,
+    /// and the step down to the canvas all make such lines; the painting's own lines rarely run edge to edge).
+    /// Returns the canvas as a quad within the straightened painting, or nil if there is no frame to remove.
+    private static func findCanvas(in image: CIImage) -> [NormPoint]? {
+        let e = image.extent
+        let scale = min(1, 640 / max(e.width, e.height))
+        let small = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        guard let cg = context.createCGImage(small, from: small.extent.integral, format: .RGBA8, colorSpace: sRGB) else {
+            return nil
+        }
+        let w = cg.width, h = cg.height
+        guard w >= 80, h >= 80 else { return nil }
+
+        // Pixels as floats, row 0 at the top.
+        var bytes = [UInt8](repeating: 0, count: w * h * 4)
+        let drawn = bytes.withUnsafeMutableBytes { buffer -> Bool in
+            guard let ctx = CGContext(data: buffer.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                      space: sRGB, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        guard drawn else { return nil }
+        let px = bytes.map { Float($0) / 255 }
+        func pixel(_ x: Int, _ y: Int) -> SIMD3<Float> {
+            let i = (y * w + x) * 4
+            return SIMD3(px[i], px[i + 1], px[i + 2])
+        }
+
+        // For one side: `sample(depth, along)` reads the pixel `depth` in from that side.
+        // Returns the depths of the straight lines found, outermost first, with their strength.
+        func lines(length: Int, across: Int, sample: (Int, Int) -> SIMD3<Float>) -> [(depth: Int, score: Float)] {
+            let strip = 3
+            let maxDepth = Int(Double(across) * 0.25)
+            guard maxDepth > strip * 2 + 2 else { return [] }
+            let along = Array(stride(from: Int(Double(length) * 0.12), to: Int(Double(length) * 0.88), by: 1))
+            // Colour change across each depth, for every position along the side.
+            var change = [[Float]](repeating: [], count: maxDepth)
+            for d in strip..<(maxDepth - strip) {
+                change[d] = along.map { a in
+                    var outer = SIMD3<Float>(repeating: 0), inner = SIMD3<Float>(repeating: 0)
+                    for k in 1...strip {
+                        outer += sample(d - k, a)
+                        inner += sample(d + k - 1, a)
+                    }
+                    let diff = abs(outer - inner) / Float(strip)
+                    return (diff.x + diff.y + diff.z) / 3
+                }
+            }
+            // A line counts if it is there along most of the side (median), allowing it to wander by a pixel.
+            var score = [Float](repeating: 0, count: maxDepth)
+            for d in (strip + 1)..<(maxDepth - strip - 1) {
+                var best = [Float](repeating: 0, count: along.count)
+                for i in 0..<along.count {
+                    best[i] = max(change[d - 1][i], change[d][i], change[d + 1][i])
+                }
+                best.sort()
+                score[d] = best[best.count / 2]
+            }
+            let strongest = score.max() ?? 0
+            guard strongest >= 0.06 else { return [] }
+            var found: [(depth: Int, score: Float)] = []
+            for d in (strip + 1)..<(maxDepth - strip - 1) {
+                let lo = max(0, d - 3), hi = min(maxDepth - 1, d + 3)
+                if score[d] >= 0.06, score[d] >= strongest * 0.4, score[d] == score[lo...hi].max() {
+                    found.append((d, score[d]))
+                }
+            }
+            return found
+        }
+
+        // How much a strip running along a side changes along its length, beyond slow changes in the light.
+        // A frame or mat looks much the same all the way along; a strip of painting does not.
+        func busyness(length: Int, from: Int, to: Int, sample: (Int, Int) -> SIMD3<Float>) -> Float {
+            let step = max(1, (to - from) / 6)
+            let profile: [SIMD3<Float>] = (0..<length).map { a in
+                var sum = SIMD3<Float>(repeating: 0), n: Float = 0
+                for d in stride(from: from, to: to, by: step) { sum += sample(d, a); n += 1 }
+                return sum / max(n, 1)
+            }
+            func smooth(_ p: [SIMD3<Float>], _ radius: Int) -> [SIMD3<Float>] {
+                var prefix = [SIMD3<Float>(repeating: 0)]
+                for v in p { prefix.append(prefix.last! + v) }
+                return (0..<p.count).map { i in
+                    let lo = max(0, i - radius), hi = min(p.count, i + radius + 1)
+                    return (prefix[hi] - prefix[lo]) / Float(hi - lo)
+                }
+            }
+            let fine = smooth(profile, max(1, length / 40)), coarse = smooth(profile, max(2, length / 6))
+            let lo = length / 20, hi = length - length / 20
+            var total: Float = 0
+            for i in lo..<hi { let d = abs(fine[i] - coarse[i]); total += (d.x + d.y + d.z) / 3 }
+            return total / Float(max(1, hi - lo))
+        }
+
+        typealias Side = (length: Int, across: Int, sample: (Int, Int) -> SIMD3<Float>)
+        let sideReaders: [Side] = [
+            (h, w, { d, a in pixel(d, a) }),             // left
+            (h, w, { d, a in pixel(w - 1 - d, a) }),     // right
+            (w, h, { d, a in pixel(a, d) }),             // top
+            (w, h, { d, a in pixel(a, h - 1 - d) })      // bottom
+        ]
+        let sides = sideReaders.map { lines(length: $0.length, across: $0.across, sample: $0.sample) }
+        /// Whether the strip outside `depth` on side `i` looks like frame rather than painting.
+        func looksLikeFrame(_ i: Int, _ depth: Int) -> Bool {
+            let r = sideReaders[i]
+            // A thin frame is too narrow to judge, and a painting's own lines rarely sit that close to its edge.
+            guard Double(depth) > Double(r.across) * 0.04 else { return true }
+            let outside = busyness(length: r.length, from: 1, to: depth - 2, sample: r.sample)
+            let inside = busyness(length: r.length, from: depth + 2, to: min(r.across / 2, depth + max(depth, r.across / 12)), sample: r.sample)
+            return outside < 0.015 || outside < inside * 0.5
+        }
+        // A frame (or mat) is about as wide on every side, so look for the widest frame width that has a line
+        // on at least three sides with frame, not painting, outside it; lines in the painting rarely line up like that.
+        var best: (width: Int, depths: [Int])?
+        for width in Set(sides.flatMap { $0.map(\.depth) }).sorted().reversed() {
+            let tolerance = Double(width) * 0.35 + 4
+            let picks = sides.map { side in
+                side.filter { abs(Double($0.depth - width)) <= tolerance }.max { $0.score < $1.score }?.depth
+            }
+            guard picks.compactMap({ $0 }).count >= 3 else { continue }
+            // A side with no line near this width (often the bottom, seen from below) takes its own deepest
+            // frame-like line up to twice the width.
+            let depths = (0..<4).map { i in
+                picks[i] ?? sides[i].map(\.depth).filter { $0 <= width * 2 + 4 && looksLikeFrame(i, $0) }.max() ?? width
+            }
+            guard (0..<4).filter({ looksLikeFrame($0, depths[$0]) }).count >= 3 else { continue }
+            // The frame's edges should be clear lines, not faint ones.
+            let strengths = (0..<4).compactMap { i in sides[i].first { $0.depth == depths[i] }?.score }
+            guard strengths.reduce(0, +) / Float(max(1, strengths.count)) >= 0.1 else { continue }
+            best = (width, depths)
+            break
+        }
+        guard let depths = best?.depths else { return nil }
+
+        // Trim a hair more, so no sliver of the frame's lip is left.
+        let l = Double(depths[0] + 2) / Double(w), r = Double(depths[1] + 2) / Double(w)
+        let t = Double(depths[2] + 2) / Double(h), b = Double(depths[3] + 2) / Double(h)
+        guard l + r < 0.7, t + b < 0.7 else { return nil }
+        // Bottom-left origin, as Vision gives quads: top-left, top-right, bottom-right, bottom-left.
+        return [NormPoint(x: l, y: 1 - t), NormPoint(x: 1 - r, y: 1 - t), NormPoint(x: 1 - r, y: b), NormPoint(x: l, y: b)]
     }
 
     private static func area(of quad: [NormPoint]) -> CGFloat {
