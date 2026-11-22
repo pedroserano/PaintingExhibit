@@ -430,7 +430,7 @@ enum PaintingProcessor {
                 ?? rectangle
                 ?? shaped(document)
                 // Otherwise assume the painting fills the photo, with its frame near the edges or out of shot.
-                ?? (findCanvas(in: base) != nil ? wholePhoto : nil)
+                ?? (findCanvas(in: base, judgeWideFrames: false) != nil ? wholePhoto : nil)
                 ?? straighten(wholePhoto, in: base) else {
             return settings
         }
@@ -744,7 +744,7 @@ enum PaintingProcessor {
     /// that runs the length of that side with a clear change of colour across it (a frame's mouldings, a mat,
     /// and the step down to the canvas all make such lines; the painting's own lines rarely run edge to edge).
     /// Returns the canvas as a quad within the straightened painting, or nil if there is no frame to remove.
-    private static func findCanvas(in image: CIImage) -> [NormPoint]? {
+    private static func findCanvas(in image: CIImage, judgeWideFrames: Bool = true) -> [NormPoint]? {
         let e = image.extent
         let scale = min(1, 640 / max(e.width, e.height))
         let small = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
@@ -813,6 +813,13 @@ enum PaintingProcessor {
             let inside = busyness(length: r.length, from: depth + 2, to: min(r.across / 2, depth + max(depth, r.across / 12)), sample: r.sample)
             return outside < 0.015 || outside < inside * 0.5
         }
+        // The colour make-up of the painting's centre, to tell frame from painting.
+        var centreCounts = [Float](repeating: 0, count: 64)
+        for y in stride(from: h * 3 / 10, to: h * 7 / 10, by: 2) {
+            for x in stride(from: w * 3 / 10, to: w * 7 / 10, by: 2) { centreCounts[colourBin(pixel(x, y))] += 1 }
+        }
+        let centreTotal = centreCounts.reduce(0, +)
+        let centre = centreCounts.map { $0 / max(centreTotal, 1) }
         // A frame (or mat) is about as wide on every side, so look for the widest frame width that has a line
         // on at least three sides with frame, not painting, outside it; lines in the painting rarely line up like that.
         var best: (width: Int, depths: [Int])?
@@ -831,6 +838,10 @@ enum PaintingProcessor {
             // The frame's edges should be clear lines, not faint ones.
             let strengths = (0..<4).compactMap { i in sides[i].first { $0.depth == depths[i] }?.score }
             guard strengths.reduce(0, +) / Float(max(1, strengths.count)) >= 0.1 else { continue }
+            // In a busy painting (foliage, a crowd) lines line up at many depths, so a frame found unusually wide
+            // must also differ in colour from the painting and from what lies inside it, on at least three sides.
+            if judgeWideFrames, (0..<4).contains(where: { Double(depths[$0]) > Double(sideReaders[$0].across) * 0.2 }),
+               (0..<4).filter({ depths[$0] > 0 && bandIsFrame(sideReaders[$0], to: depths[$0], centre: centre) }).count < 3 { continue }
             best = (width, depths)
             break
         }
@@ -848,12 +859,6 @@ enum PaintingProcessor {
 
         // A carved rail is as busy as a painting, so the checks above often stop at its outer mouldings. Its
         // colours give it away: going in from the edge, bands keep the rail's colour make-up until the canvas.
-        var centreCounts = [Float](repeating: 0, count: 64)
-        for y in stride(from: h * 3 / 10, to: h * 7 / 10, by: 2) {
-            for x in stride(from: w * 3 / 10, to: w * 7 / 10, by: 2) { centreCounts[colourBin(pixel(x, y))] += 1 }
-        }
-        let centreTotal = centreCounts.reduce(0, +)
-        let centre = centreCounts.map { $0 / max(centreTotal, 1) }
         let rails = (0..<4).map { railDepth(sideReaders[$0], known: depths[$0], lines: sides[$0], centre: centre) }
         // Rails come in pairs: a plain background running down one side of a painting doesn't. Left and right
         // must both be found and about as deep; top and bottom may differ more (the frame's shadow below it).
