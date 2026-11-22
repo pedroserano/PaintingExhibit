@@ -7,6 +7,19 @@ struct IdentifySettings: View {
 
     var body: some View {
         Section {
+            Toggle("Identify new paintings automatically", isOn: $library.identifyAutomatically)
+        } header: {
+            Text("Identify paintings")
+        } footer: {
+            Text("""
+            Free, with no account: the app reads caption labels in your photos, works out the museum from \
+            where each photo was taken, and compares your photo with that museum's paintings from Wikidata, on \
+            this device. The first photo from a museum fetches its paintings once, which can take a while for a \
+            large museum. Only names and IDs are looked up; your photos stay on the device.
+            """)
+        }
+
+        Section {
             if library.hasGoogleKey {
                 LabeledContent("Google Cloud Vision key", value: "Saved")
                 Button("Remove Key", role: .destructive) { library.setGoogleKey(nil) }
@@ -23,17 +36,17 @@ struct IdentifySettings: View {
                 }
                 .disabled(key.trimmingCharacters(in: .whitespaces).isEmpty)
             }
-            Toggle("Identify new paintings automatically", isOn: $library.identifyAutomatically)
-            LabeledContent("Lookups this month", value: "\(library.lookupsThisMonth) of \(Library.monthlyLookupLimit)")
+            if library.hasGoogleKey {
+                LabeledContent("Google lookups this month", value: "\(library.lookupsThisMonth) of \(Library.monthlyLookupLimit)")
+            }
         } header: {
-            Text("Identify paintings")
+            Text("Google reverse image search (optional)")
         } footer: {
             Text("""
-            Each painting is looked up once with Google's reverse image search, then matched to the work in \
-            Wikidata for its artist, date and museum, and checked by comparing the two images on this device. \
-            Only the cropped painting goes to Google, without its location or other photo details. \
-            Google's first 1,000 lookups a month are free; the app stops at \(Library.monthlyLookupLimit). \
-            The key is kept in the Keychain.
+            For paintings the free search can't place, with a free Google Cloud Vision key of your own. \
+            Only the cropped painting goes to Google, without its location or other photo details. Google's \
+            first 1,000 lookups a month are free; the app stops at \(Library.monthlyLookupLimit). The key is \
+            kept in the Keychain.
             """)
         }
     }
@@ -81,7 +94,7 @@ struct IdentityView: View {
                     } label: {
                         Label(identity?.searchedAt == nil ? "Search" : "Search Again", systemImage: "magnifyingglass")
                     }
-                    .disabled(searching || !library.hasGoogleKey || library.lookupsLeft == 0)
+                    .disabled(searching)
                 }
             }
             .onAppear(perform: loadFields)
@@ -117,7 +130,7 @@ struct IdentityView: View {
                     Link("About this work", destination: url)
                 }
             } else {
-                Text(library.hasGoogleKey ? "Not searched for yet." : "Add a Google Cloud Vision API key in Settings to search for this painting, or type its details below.")
+                Text("Not searched for yet. Search looks for a caption label and in the museum where you took the photo, or you can type the details below.")
                     .font(.callout)
             }
             if let error { Text(error).font(.footnote).foregroundStyle(.orange) }
@@ -126,16 +139,18 @@ struct IdentityView: View {
 
     private func statusText(_ i: Identification) -> String {
         let name = [i.title, i.artist].compactMap { $0 }.joined(separator: " by ")
+        let seen = i.museums.first.map { " Photographed at \($0)." } ?? ""
+        let via = i.via.map { " Found from \($0)." } ?? ""
         switch i.status {
-        case .matched: return "Identified as \(name). The museum's image matches your photo."
+        case .matched: return "Identified as \(name). The work's image matches your photo.\(via)\(seen)"
         case .possible:
-            return i.distance == nil
+            return (i.distance == nil
                 ? "Possibly \(name). There was no image to compare with yours, so please check."
-                : "Possibly \(name). The images are alike but not certainly the same work: please check."
+                : "Possibly \(name). The images are alike but not certainly the same work: please check.") + via + seen
         case .confirmed: return name.isEmpty ? "Details set by you." : "\(name), confirmed by you."
         case .unidentified:
-            return i.candidates.isEmpty ? "No match found. You can type the details below."
-                                        : "No confident match. If one of these is it, choose it; or type the details below."
+            return (i.candidates.isEmpty ? "No match found. You can type the details below."
+                                         : "No confident match. If one of these is it, choose it; or type the details below.") + seen
         }
     }
 

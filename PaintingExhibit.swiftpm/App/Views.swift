@@ -170,6 +170,14 @@ struct GalleryView: View {
                 }
                 .padding(.horizontal)
             }
+            if let museum = library.indexingMuseum {
+                ProgressView(value: Double(library.indexDone), total: Double(max(library.indexTotal, 1))) {
+                    Text(library.indexTotal == 0 ? "Listing the paintings of \(museum)…"
+                         : "Fetching the paintings of \(museum) to compare with yours: \(library.indexDone) of \(library.indexTotal) (once only)")
+                        .font(.footnote)
+                }
+                .padding(.horizontal)
+            }
             if reviewOnly {
                 Text(shown.isEmpty ? "No matches left to check." :
                         "Possible matches to check: open each one and confirm it, choose another, or type the details.")
@@ -243,12 +251,10 @@ struct GalleryView: View {
                 Button("Change album", systemImage: "rectangle.stack") {
                     library.albumID = nil
                 }
-                if library.hasGoogleKey {
-                    Button("Identify paintings", systemImage: "magnifyingglass") {
-                        Task { await library.identifyPending(force: true) }
-                    }
-                    .disabled(library.isIdentifying)
+                Button("Identify paintings", systemImage: "magnifyingglass") {
+                    Task { await library.identifyPending(force: true) }
                 }
+                .disabled(library.isIdentifying)
                 #if os(iOS)
                 Divider()
                 Button("Settings", systemImage: "gearshape") { showSettings = true }
@@ -334,6 +340,8 @@ struct ExhibitView: View {
     @State private var showLabel = true
     @State private var adjusting: Painting?
     @State private var identifying: Painting?
+    @State private var lookingUp: Painting?
+    @State private var colouring: Painting?
     @FocusState private var focused: Bool
     /// The paintings to move through: those in `only`, in album order, or all of them.
     private let only: [String]?
@@ -386,6 +394,22 @@ struct ExhibitView: View {
         .onChange(of: showLabel) { focused = true }
         .onChange(of: adjusting) { _, editing in if editing == nil { focused = true } }
         .onChange(of: identifying) { _, open in if open == nil { focused = true } }
+        .onChange(of: lookingUp) { _, open in if open == nil { focused = true } }
+        .onChange(of: colouring) { _, open in if open == nil { focused = true } }
+        .sheet(item: $colouring) { painting in
+            ColourView(painting: painting) { colouring = nil }
+                .environmentObject(library)
+                #if os(macOS)
+                .frame(minWidth: 720, minHeight: 640)
+                #endif
+        }
+        .sheet(item: $lookingUp) { painting in
+            LookUpView(painting: painting) { lookingUp = nil }
+                .environmentObject(library)
+                #if os(macOS)
+                .frame(minWidth: 700, minHeight: 600)
+                #endif
+        }
         .sheet(item: $identifying) { painting in
             IdentityView(paintingID: painting.id) { identifying = nil }
                 .environmentObject(library)
@@ -471,6 +495,17 @@ struct ExhibitView: View {
                 .focusable(false)
                 .tint(.white)
             }
+            if let painting = currentPainting {
+                Button {
+                    colouring = painting
+                } label: {
+                    Label("White Balance", systemImage: "eyedropper.halffull")
+                        .font(.subheadline)
+                }
+                .buttonStyle(.bordered)
+                .focusable(false)
+                .tint(.white)
+            }
             if let painting = currentPainting, painting.settings.frameFound, painting.manualCrop == nil {
                 let keeps = library.keepsFrame(painting)
                 Button {
@@ -483,7 +518,7 @@ struct ExhibitView: View {
                 .focusable(false)
                 .tint(.white)
             }
-            if let painting = currentPainting, library.hasGoogleKey || painting.identification != nil {
+            if let painting = currentPainting {
                 Button {
                     identifying = painting
                 } label: {
@@ -493,6 +528,16 @@ struct ExhibitView: View {
                 .buttonStyle(.bordered)
                 .focusable(false)
                 .tint(.white)
+                Button {
+                    lookingUp = painting
+                } label: {
+                    Label("Look Up", systemImage: "info.circle")
+                        .font(.subheadline)
+                }
+                .buttonStyle(.bordered)
+                .focusable(false)
+                .tint(.white)
+                .help("Apple's Visual Look Up")
             }
             Spacer()
             Button(action: close) {
@@ -561,6 +606,9 @@ struct WallLabel: View {
             } else {
                 Text(painting.identification == nil ? "Not yet identified" : "Unidentified")
                     .font(.system(.headline, design: .serif))
+                if let museum = painting.identification?.museums.first {
+                    Text("Seen at \(museum)").font(.system(.footnote, design: .serif))
+                }
             }
             if let date = painting.takenAt {
                 Text("Photographed \(date.formatted(date: .long, time: .omitted))")
@@ -591,6 +639,7 @@ struct WallLabel: View {
             parts.append("no frame found")
         }
         if s.unevenLightFixed { parts.append("spotlight evened") }
+        if s.colour != nil { parts.append("white balance set by hand") }
         if painting.photosRecipe != nil { parts.append("saved to Photos") }
         if keepsFrame != s.keptFrame && painting.manualCrop == nil { parts.append("updating…") }
         switch painting.identification?.status {

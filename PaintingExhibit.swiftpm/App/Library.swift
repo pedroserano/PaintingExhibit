@@ -19,6 +19,8 @@ struct Painting: Codable, Identifiable, Hashable {
     var photosLeftAlone: Bool?
     /// Corners set by hand, used instead of the automatic crop (kept when paintings are processed again).
     var manualCrop: ManualCrop?
+    /// Text read from the photo (a caption label in the frame, a sign), kept for identification.
+    var photoText: [String]?
     /// Which painting this is, once searched for (kept when paintings are processed again).
     var identification: Identification?
 }
@@ -101,6 +103,14 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     @Published private(set) var identifyTotal = 0
     /// Paintings being looked up right now, one at a time.
     @Published private(set) var searching: Set<String> = []
+    /// The museum whose paintings are being fetched for searching, with progress.
+    @Published private(set) var indexingMuseum: String?
+    @Published private(set) var indexDone = 0
+    @Published private(set) var indexTotal = 0
+    private var museumIndexes: [String: MuseumIndex] = [:]
+    /// Museums whose paintings were fetched (or tried) since the app started: each is tried once a session.
+    private var museumsFetched: Set<String> = []
+    private var museumsNear: [String: [Museum]] = [:]
 
     private static var monthKey: String {
         let c = Calendar.current.dateComponents([.year, .month], from: Date())
@@ -224,6 +234,38 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         Task { await processNew() }
     }
 
+    // MARK: White balance by hand
+
+    @Published private(set) var recolouring: Set<String> = []
+
+    /// Sets a painting's white balance by hand (nil: back to none) and redraws it. Kept when the painting is
+    /// processed again, and saved to Photos with the rest of the edit when that is on.
+    func setColour(_ colour: ColourAdjust?, for id: String) async {
+        guard let i = paintings.firstIndex(where: { $0.id == id }) else { return }
+        let neutral = colour.map { abs($0.warmth) < 0.005 && abs($0.tint) < 0.005 } ?? true
+        var settings = paintings[i].settings
+        settings.colour = neutral ? nil : colour
+        guard settings != paintings[i].settings,
+              let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject else { return }
+        recolouring.insert(id)
+        defer { recolouring.remove(id) }
+        let url = cacheFolder.appendingPathComponent(paintings[i].fileName)
+        do {
+            let data = try await Self.source(for: asset).data
+            let fixed = settings
+            let drawn = try await Task.detached(priority: .userInitiated) {
+                try PaintingProcessor.render(imageData: data, settings: fixed, writeTo: url)
+            }.value
+            guard let j = paintings.firstIndex(where: { $0.id == id }) else { return }
+            paintings[j].settings = drawn
+            paintings[j].renderedAt = Date()
+            save()
+            if saveEditsToPhotos { await processNew() }
+        } catch {
+            lastError = "The painting couldn't be redrawn: \(error.localizedDescription)"
+        }
+    }
+
     // MARK: Fixing a crop by hand
 
     /// The photo as the crop's corners refer to it, for setting them by hand.
@@ -306,57 +348,161 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         if hasGoogleKey { Task { await identifyPending() } }
     }
 
-    /// Looks up every painting not yet searched for, when automatic identification is on (or `force`),
-    /// one at a time, stopping at the monthly limit or on an error such as a bad key.
+    /// Looks up every painting not yet searched for, when automatic identification is on (or `force`), one at
+    /// a time. Free sources come first (the caption label, the museum's collection); Google only with a key.
     func identifyPending(force: Bool = false) async {
-        guard hasGoogleKey, identifyAutomatically || force, !isIdentifying else { return }
-        let pending = paintings.filter { $0.identification == nil }.map(\.id)
+        guard identifyAutomatically || force, !isIdentifying else { return }
+        // Paintings photographed close together first, so each museum's paintings are fetched once.
+        let pending = paintings.filter { $0.identification == nil }
+            .sorted { ($0.takenAt ?? .distantPast) < ($1.takenAt ?? .distantPast) }
+            .map(\.id)
         guard !pending.isEmpty else { return }
         isIdentifying = true
         identifyDone = 0
-        identifyTotal = min(pending.count, lookupsLeft)
-        defer { isIdentifying = false }
+        identifyTotal = pending.count
+        defer { isIdentifying = false; indexingMuseum = nil }
         for id in pending {
-            guard lookupsLeft > 0 else {
-                lastError = "Reached this month's \(Self.monthlyLookupLimit) Google lookups; the rest will be identified next month."
-                return
-            }
             guard paintings.contains(where: { $0.id == id && $0.identification == nil }) else { continue }
             do {
-                try await identify(id)
+                try await identify(id, useGoogle: true)
+            } catch IdentifyError.google(let message) {
+                // Google failing (a bad key, the month's limit) stops only Google; the free search carries on.
+                lastError = "Google couldn't search: \(message). Other paintings are still searched without it."
             } catch {
                 lastError = error.localizedDescription
-                return
             }
             identifyDone += 1
         }
     }
 
-    /// Searches for one painting (using one of the month's lookups) and stores what was found. A painting
-    /// confirmed by hand keeps its details; the new search only refreshes the other candidates.
-    func identify(_ id: String) async throws {
-        guard let key = APIKeyStore.load() else { throw IdentifyError.noKey }
-        guard lookupsLeft > 0 else {
-            throw IdentifyError.google("this month's \(Self.monthlyLookupLimit) free lookups are used up")
-        }
+    /// Searches for one painting and stores what was found: first its caption label, then the collections of
+    /// the museums where it was photographed, then (if a key is saved and the free search wasn't certain)
+    /// Google. A painting confirmed by hand keeps its details; the search only refreshes the other candidates.
+    func identify(_ id: String, useGoogle: Bool = true) async throws {
         guard let painting = paintings.first(where: { $0.id == id }),
-              let url = await imageURL(for: painting) else { throw IdentifyError.noImage }
+              let url = await imageURL(for: painting),
+              let crop = Identifier.loadImage(url, maxPixel: 1024) else { throw IdentifyError.noImage }
         searching.insert(id)
         defer { searching.remove(id) }
-        UserDefaults.standard.set(lookupsThisMonth + 1, forKey: Self.monthKey)
-        let found = try await Identifier.identify(imageAt: url, apiKey: key)
+
+        var results: [Identification] = []
+        func settled() -> Bool { results.contains { $0.status == .matched } }
+
+        // 1. The caption label: in the photo itself, or a label photo taken within two minutes of it.
+        let lines = await labelLines(for: id)
+        if !lines.isEmpty, let found = await Identifier.fromLabel(lines, photo: crop) { results.append(found) }
+
+        // 2. The museums where it was photographed.
+        var museums: [Museum] = []
+        if !settled(), let lat = painting.latitude, let lon = painting.longitude {
+            museums = await museumsNear(lat, lon)
+            for museum in museums where !settled() {
+                guard let index = await museumIndex(museum) else { continue }
+                if let found = await Identifier.fromMuseum(index, photo: crop) { results.append(found) }
+            }
+        }
+
+        // 3. Google, when a key is saved, as the last resort.
+        var googleError: Error?
+        if !settled(), useGoogle, let key = APIKeyStore.load(), lookupsLeft > 0 {
+            UserDefaults.standard.set(lookupsThisMonth + 1, forKey: Self.monthKey)
+            do { results.append(try await Identifier.identify(imageAt: url, apiKey: key)) } catch { googleError = error }
+        }
+
+        var found = Self.combine(results)
+        found.museums = museums.map(\.name)
         guard let i = paintings.firstIndex(where: { $0.id == id }) else { return }
         if var kept = paintings[i].identification, kept.status == .confirmed {
             kept.candidates = found.candidates
             kept.pages = found.pages
             kept.clues = found.clues
             kept.guess = found.guess
+            kept.museums = found.museums
             kept.searchedAt = found.searchedAt
             paintings[i].identification = kept
         } else {
             paintings[i].identification = found
         }
         save()
+        if let googleError { throw googleError }
+    }
+
+    /// One answer from several searches: a match beats a possible match, the closer image wins between equals,
+    /// and every candidate stays on offer.
+    private static func combine(_ results: [Identification]) -> Identification {
+        func score(_ r: Identification) -> (Int, Float) {
+            let order: [Identification.Status: Int] = [.matched: 0, .possible: 1, .unidentified: 2, .confirmed: 0]
+            return (order[r.status] ?? 2, r.distance ?? (r.title == nil ? 9 : 0.9))
+        }
+        var best = results.min { score($0) < score($1) } ?? Identification(status: .unidentified, searchedAt: Date())
+        best.searchedAt = Date()
+        for r in results {
+            for c in r.candidates where !best.candidates.contains(where: { $0.id == c.id }) { best.candidates.append(c) }
+            if best.pages.isEmpty { best.pages = r.pages }
+            if best.clues.isEmpty { best.clues = r.clues }
+            if best.guess == nil { best.guess = r.guess }
+        }
+        best.candidates.sort { ($0.distance ?? 1) < ($1.distance ?? 1) }
+        return best
+    }
+
+    /// Text read from the photo and from label photos taken within two minutes of it (photos that are mostly
+    /// a caption: at least a few lines of text).
+    private func labelLines(for id: String) async -> [String] {
+        guard let painting = paintings.first(where: { $0.id == id }) else { return [] }
+        var lines = await photoText(for: id)
+        if let taken = painting.takenAt {
+            let neighbours = paintings.filter { other in
+                other.id != id && other.takenAt.map { abs($0.timeIntervalSince(taken)) <= 120 } == true
+            }
+            for other in neighbours {
+                let text = await photoText(for: other.id)
+                if text.joined().count >= 30 { lines += text }
+            }
+        }
+        return lines
+    }
+
+    /// The text in a photo, read on the device once and kept.
+    private func photoText(for id: String) async -> [String] {
+        if let known = paintings.first(where: { $0.id == id })?.photoText { return known }
+        guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject,
+              let data = try? await Self.source(for: asset).data else { return [] }
+        let text = await Task.detached(priority: .utility) { Identifier.readText(imageData: data) }.value
+        if let i = paintings.firstIndex(where: { $0.id == id }) {
+            paintings[i].photoText = text
+            save()
+        }
+        return text
+    }
+
+    /// The museums within 400 m of a place (looked up once per spot).
+    private func museumsNear(_ latitude: Double, _ longitude: Double) async -> [Museum] {
+        let spot = String(format: "%.3f,%.3f", latitude, longitude)
+        if let known = museumsNear[spot] { return known }
+        let found = await MuseumFinder.museums(near: latitude, longitude)
+        if !found.isEmpty { museumsNear[spot] = found }
+        return found
+    }
+
+    /// A museum's paintings, ready to search; fetched the first time (which can take a while for a large
+    /// museum, with progress shown) and kept on the device.
+    private func museumIndex(_ museum: Museum) async -> MuseumIndex? {
+        let index = museumIndexes[museum.q] ?? MuseumIndex.load(key: museum.q)
+        museumIndexes[museum.q] = index
+        if !index.isComplete, museumsFetched.insert(museum.q).inserted {
+            indexingMuseum = museum.name
+            indexDone = 0
+            indexTotal = 0
+            await index.build(for: [museum]) { done, total in
+                await MainActor.run {
+                    self.indexDone = done
+                    self.indexTotal = total
+                }
+            }
+            indexingMuseum = nil
+        }
+        return index.works.isEmpty ? nil : index
     }
 
     /// Takes one of the candidates as the painting, confirmed.
@@ -455,6 +601,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                 let keep = previous?.keepFrame ?? keepFramesByDefault
                 let fileName = previous?.fileName ?? Self.fileName(for: id)
                 let manual = previous?.manualCrop
+                let colour = previous?.settings.colour
                 let url = cacheFolder.appendingPathComponent(fileName)
 
                 let settings: ProcessingSettings
@@ -468,7 +615,8 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                     }.value
                 } else {
                     settings = try await Task.detached(priority: .userInitiated) {
-                        try PaintingProcessor.analyzeAndRender(imageData: data, keepFrame: keep, manual: manual, writeTo: url)
+                        try PaintingProcessor.analyzeAndRender(imageData: data, keepFrame: keep, manual: manual,
+                                                               colour: colour, writeTo: url)
                     }.value
                 }
 
@@ -485,6 +633,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                     photosRecipe: previous?.photosRecipe,
                     photosLeftAlone: previous?.photosLeftAlone,
                     manualCrop: manual,
+                    photoText: previous?.photoText,
                     identification: previous?.identification
                 )
                 if let i = paintings.firstIndex(where: { $0.id == id }) {

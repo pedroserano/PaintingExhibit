@@ -31,6 +31,13 @@ struct ManualCrop: Codable, Hashable {
     var lensK: Double?
 }
 
+/// White balance set by hand: warmth from blue (−1) to amber (+1), tint from green (−1) to magenta (+1).
+struct ColourAdjust: Codable, Hashable {
+    var warmth: Float = 0
+    var tint: Float = 0
+    static let neutral = ColourAdjust()
+}
+
 /// The non-destructive edit recipe for one painting. The photo in Photos is never changed;
 /// the exhibit image is drawn from the original with these values, and can be redrawn at any time.
 struct ProcessingSettings: Codable, Hashable {
@@ -60,6 +67,9 @@ struct ProcessingSettings: Codable, Hashable {
     var gainRight: Float
     var gainTop: Float
     var gainBottom: Float
+
+    /// White balance set by hand (nil: none).
+    var colour: ColourAdjust?
 
     /// Exposure, computed on first render. Nil means "work it out again" (e.g. after the frame choice changes).
     var blackPoint: Float?
@@ -101,7 +111,7 @@ enum PaintingProcessor {
     /// Returns the recipe, with the exposure it settled on filled in.
     /// With `manual`, the corners someone set by hand are used instead of finding the painting.
     static func analyzeAndRender(imageData: Data, keepFrame: Bool, manual: ManualCrop? = nil,
-                                 writeTo url: URL) throws -> ProcessingSettings {
+                                 colour: ColourAdjust? = nil, writeTo url: URL) throws -> ProcessingSettings {
         var (base, baseCG) = try prepare(imageData)
         // Straighten bent lines first: the frame is found and cropped far more reliably once its edges are straight.
         let lensK = manual.map { $0.lensK } ?? estimateLens(in: baseCG)
@@ -109,7 +119,26 @@ enum PaintingProcessor {
         var settings = analyze(base: base, baseCG: baseCG, keepFrame: keepFrame,
                                focal35: lensK == nil ? focalLength35(of: imageData) : nil, forcedQuad: manual?.quad)
         settings.lensK = lensK
+        settings.colour = colour
         return try render(base: base, settings: settings, writeTo: url)
+    }
+
+    // MARK: White balance by hand
+
+    /// The channel gains for a hand-set white balance, keeping brightness the same.
+    static func colourGains(_ c: ColourAdjust?) -> SIMD3<Float> {
+        guard let c else { return SIMD3(1, 1, 1) }
+        let raw = SIMD3<Float>(expf(0.4 * c.warmth), expf(-0.3 * c.tint), expf(-0.4 * c.warmth))
+        let luminance = 0.2126 * raw.x + 0.7152 * raw.y + 0.0722 * raw.z
+        return raw / luminance
+    }
+
+    /// The warmth and tint that make a colour (linear light, as drawn without any hand-set balance) neutral grey.
+    static func neutralizing(_ c: SIMD3<Float>) -> ColourAdjust {
+        let r = max(c.x, 1e-4), g = max(c.y, 1e-4), b = max(c.z, 1e-4)
+        let warmth = logf(b / r) / 0.8
+        let tint = logf(g / (r * b).squareRoot()) / 0.3
+        return ColourAdjust(warmth: max(-1, min(1, warmth)), tint: max(-1, min(1, tint)))
     }
 
     /// The photo as the recipe's corners refer to it (orientation applied, lens distortion `lensK` undone),
@@ -1349,7 +1378,8 @@ enum PaintingProcessor {
         let gl = settings.gainLeft, gr = settings.gainRight, gt = settings.gainTop, gb = settings.gainBottom
         let colGain: [Float] = (0..<w).map { x in gl + (gr - gl) * Float(x) / Float(w - 1) }
         let rowGain: [Float] = (0..<h).map { y in gt + (gb - gt) * Float(y) / Float(h - 1) }
-        let wb = [settings.whiteBalance.x, settings.whiteBalance.y, settings.whiteBalance.z]
+        let hand = colourGains(settings.colour)
+        let wb = [settings.whiteBalance.x * hand.x, settings.whiteBalance.y * hand.y, settings.whiteBalance.z * hand.z]
 
         if settings.blackPoint == nil || settings.exposure == nil {
             // Brightness range after colour and spotlight correction (sampled).

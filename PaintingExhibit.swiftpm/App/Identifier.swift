@@ -36,9 +36,13 @@ struct Identification: Codable, Hashable {
     var candidates: [Candidate] = []
     /// Web pages showing the same picture.
     var pages: [WebPage] = []
-    /// Visual distance between the photo and the chosen work's image (lower is closer; under about 0.45
+    /// Visual distance between the photo and the chosen work's image (lower is closer; under about 0.42
     /// is the same painting).
     var distance: Float?
+    /// How the match was found: "the caption label", "the museum's collection", "Google".
+    var via: String?
+    /// The museums the photo was taken in, from its location.
+    var museums: [String] = []
 
     var isIdentified: Bool { title != nil && status != .unidentified }
 }
@@ -81,9 +85,10 @@ enum IdentifyError: LocalizedError {
 /// Only the cropped painting is sent to Google (small, with no location or other photo details). Wikidata
 /// and Wikimedia Commons receive only the names and IDs being looked up.
 enum Identifier {
-    /// Distances at or under this are the same painting (measured: your photos of a painting against its
-    /// museum image came out 0.24–0.47, and details of it up to 0.52; different paintings 0.6 and over).
-    static let sameWork: Float = 0.45
+    /// Distances at or under this are the same painting. Measured on the album's photos against works' large
+    /// images: matches up to 0.42 were all right; between 0.42 and 0.58 about half were (details, other
+    /// versions, look-alikes), so those are left to be checked; different paintings were mostly 0.6 and over.
+    static let sameWork: Float = 0.42
     /// Distances at or under this are probably the same painting, or another version of it.
     static let likelyWork: Float = 0.58
     /// Identifies the client to Wikidata and Wikimedia Commons, as they ask.
@@ -111,29 +116,13 @@ enum Identifier {
             }
         }
 
-        // Compare the photo with each work's image.
-        var candidates: [Candidate] = []
-        for work in works.prefix(6) {
-            var c = work
-            if let photoPrint, let image = c.imageURL, let print = await remotePrint(image) {
-                c.distance = distance(photoPrint, print)
-            }
-            candidates.append(c)
-        }
         let mentioned = (web.entities.map(\.name) + [web.guess ?? ""] + web.pages.map(\.title))
             .joined(separator: " ").lowercased()
-        // Closest image first. A work with no image to compare ranks just behind a likely match when Google
-        // mentions its artist, and behind the rest when it doesn't; otherwise the search's own order holds.
-        func rank(_ c: Candidate) -> Float {
-            if let d = c.distance { return d }
-            let artistMentioned = c.artist.map { mentioned.contains($0.lowercased()) } ?? false
-            return artistMentioned ? likelyWork + 0.001 : 0.9
-        }
-        candidates = candidates.enumerated()
-            .sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }
-            .map(\.element)
+        let candidates = await compared(Array(works.prefix(6)), with: photoPrint, mentioned: mentioned)
+        func rank(_ c: Candidate) -> Float { Identifier.rank(c, mentioned: mentioned) }
 
         var result = Identification(status: .unidentified, searchedAt: Date())
+        result.via = "Google"
         result.guess = web.guess
         result.clues = Array(web.entities.map(\.name).prefix(6))
         result.pages = Array(web.pages.prefix(8))
@@ -163,6 +152,111 @@ enum Identifier {
         if result.title == nil { result.status = .unidentified }
         return result
     }
+
+    // MARK: Comparing candidates
+
+    /// Closest image first. A work with no image to compare ranks just behind a likely match when its artist
+    /// is mentioned (by Google, or on the caption label), and behind the rest when not.
+    static func rank(_ c: Candidate, mentioned: String) -> Float {
+        if let d = c.distance { return d }
+        let artistMentioned = c.artist.map { !mentioned.isEmpty && mentioned.contains($0.lowercased()) } ?? false
+        return artistMentioned ? likelyWork + 0.001 : 0.9
+    }
+
+    /// The candidates with each one's image compared with the photo, best first.
+    static func compared(_ works: [Candidate], with photoPrint: VNFeaturePrintObservation?, mentioned: String) async -> [Candidate] {
+        var candidates: [Candidate] = []
+        for work in works {
+            var c = work
+            if c.distance == nil, let photoPrint, let image = c.imageURL, let print = await remotePrint(image) {
+                c.distance = distance(photoPrint, print)
+            }
+            candidates.append(c)
+        }
+        return candidates.enumerated()
+            .sorted { (rank($0.element, mentioned: mentioned), $0.offset) < (rank($1.element, mentioned: mentioned), $1.offset) }
+            .map(\.element)
+    }
+
+    // MARK: Free sources: the museum's collection and the caption label
+
+    /// Looks the photo up among the paintings of the museums it was taken in: the nearest few by thumbnail
+    /// fingerprint, then each checked against the work's large image.
+    static func fromMuseum(_ index: MuseumIndex, photo crop: CGImage) async -> Identification? {
+        guard let photoPrint = featurePrint(crop), let vector = vector(of: photoPrint) else { return nil }
+        let shortlist = await Task.detached { index.nearest(to: vector, count: 4) }.value
+        guard !shortlist.isEmpty else { return nil }
+        let candidates = await compared(shortlist.map(\.work.candidate), with: photoPrint, mentioned: "")
+        var result = Identification(status: .unidentified, searchedAt: Date())
+        result.via = "the museum's collection"
+        result.candidates = candidates.filter { ($0.distance ?? 1) <= 0.75 }
+        if let best = candidates.first, let d = best.distance, d <= likelyWork {
+            result.status = d <= sameWork ? .matched : .possible
+            result.apply(best)
+        }
+        return result
+    }
+
+    /// Looks up the works named on a caption label (read from the photo, or from a label photo taken just
+    /// before or after it). A work whose title and artist both appear on the label is taken as a match even when
+    /// its image can't be compared; otherwise the image decides.
+    static func fromLabel(_ lines: [String], photo crop: CGImage) async -> Identification? {
+        let text = lines.joined(separator: " ").lowercased()
+        let titles = labelTitleLines(lines)
+        guard !titles.isEmpty else { return nil }
+        // Each title-like line searched with the label's other short lines (one is usually the artist), which
+        // finds works by their description ("painting by Édouard Manet"), then by its name alone.
+        var works: [Candidate] = []
+        func add(_ found: [Candidate]) {
+            for w in found.prefix(6) where !works.contains(where: { $0.wikidata == w.wikidata }) { works.append(w) }
+        }
+        let short = Array(titles.prefix(4))
+        for (i, line) in short.enumerated() {
+            for other in short where other != line && i < 3 {
+                add(await artworks(searching: "\(line) \(other)"))
+            }
+        }
+        for line in short.prefix(3) where works.count < 12 { add(await artworks(named: line)) }
+        // Works whose artist is on the label first: a title alone is often shared ("Portrait of a Man").
+        let named = { (c: Candidate) in c.artist.map { text.contains($0.lowercased()) } ?? false }
+        works = works.filter(named) + works.filter { !named($0) }
+        guard !works.isEmpty else { return nil }
+        let candidates = await compared(Array(works.prefix(6)), with: featurePrint(crop), mentioned: text)
+        var result = Identification(status: .unidentified, searchedAt: Date())
+        result.via = "the caption label"
+        result.candidates = candidates
+        if let best = candidates.first {
+            if let d = best.distance, d <= likelyWork {
+                result.status = d <= sameWork || named(best) ? .matched : .possible
+                result.apply(best)
+            } else if best.distance == nil && named(best) {
+                result.status = .matched
+                result.apply(best)
+            }
+        }
+        return result
+    }
+
+    /// The lines of a caption label that could be a work's title: a few words of letters, not the medium,
+    /// dimensions, dates, credit line or museum boilerplate.
+    static func labelTitleLines(_ lines: [String]) -> [String] {
+        let skip = ["oil on", "on canvas", "on panel", "on paper", "gift of", "purchase", "fund", "collection",
+                    "bequest", "museum", "acrylic", "tempera", "watercolor", "watercolour", "gouache", "graphite",
+                    "courtesy", "lent by", "inches", " cm", "copyright", "©"]
+        return lines.compactMap { raw in
+            // Dates and life dates follow titles and names: "Chrysanthemum, 1906–42", "(Dutch, 1872–1944)".
+            let undated = raw.replacingOccurrences(of: "[,(]?\\s*(c\\.?|ca\\.?|about)?\\s*\\d{3,4}.*$", with: "",
+                                                   options: [.regularExpression, .caseInsensitive])
+            let line = undated.trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+            let words = line.split(separator: " ")
+            let letters = line.filter(\.isLetter).count
+            guard !words.isEmpty, words.count <= 10, letters >= 5,
+                  Double(letters) / Double(max(line.count, 1)) > 0.6,
+                  !skip.contains(where: { line.lowercased().contains($0) }) else { return nil }
+            return line
+        }
+    }
+
 
     // MARK: Google Cloud Vision web detection
 
@@ -256,6 +350,33 @@ enum Identifier {
 
     // MARK: Wikidata
 
+    /// Paintings found by Wikidata's full-text search, which also reads descriptions ("painting by
+    /// Édouard Manet"), most relevant first.
+    static func artworks(searching text: String) async -> [Candidate] {
+        var components = URLComponents(string: "https://www.wikidata.org/w/api.php")!
+        components.queryItems = [
+            .init(name: "action", value: "query"), .init(name: "list", value: "search"), .init(name: "format", value: "json"),
+            .init(name: "srsearch", value: "\(text) haswbstatement:P31=Q3305213"), .init(name: "srlimit", value: "8"),
+            .init(name: "srprop", value: "")
+        ]
+        var request = URLRequest(url: components.url!)
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 30
+        guard let (data, _) = try? await URLSession.shared.data(for: request),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let hits = (json["query"] as? [String: Any])?["search"] as? [[String: Any]] else { return [] }
+        let ids = hits.compactMap { $0["title"] as? String }.filter { $0.hasPrefix("Q") }
+        guard !ids.isEmpty else { return [] }
+        return await artworks(query: """
+            SELECT ?item ?itemLabel ?creatorLabel ?inception ?collectionLabel ?img ?article WHERE {
+              VALUES ?item { \(ids.map { "wd:\($0)" }.joined(separator: " ")) }
+              \(details)
+            }
+            """, order: nil).sorted { a, b in
+                (ids.firstIndex(of: a.wikidata ?? "") ?? 99) < (ids.firstIndex(of: b.wikidata ?? "") ?? 99)
+            }
+    }
+
     /// Works of art (things with a creator) that are Google entities: Wikidata records Freebase and Google
     /// Knowledge Graph IDs, the IDs Google's web detection uses.
     static func artworks(forEntityIDs ids: [String]) async -> [Candidate] {
@@ -294,48 +415,64 @@ enum Identifier {
         """
 
     private static func artworks(query: String, order: [String]?) async -> [Candidate] {
+        guard let rows = await sparql(query, timeout: 30) else { return [] }
+        var byItem: [String: (Candidate, Int)] = [:]
+        for (rowIndex, row) in rows.enumerated() {
+            guard let item = row["item"], let title = label(row["itemLabel"]) else { continue }
+            let q = String(item.split(separator: "/").last ?? "")
+            let rank = order.flatMap { o in row["mid"].flatMap { o.firstIndex(of: $0) } } ?? rowIndex
+            if var existing = byItem[q] {
+                existing.0.museum = existing.0.museum ?? label(row["collectionLabel"])
+                existing.1 = min(existing.1, rank)
+                byItem[q] = existing
+                continue
+            }
+            let candidate = Candidate(title: title, artist: label(row["creatorLabel"]), year: year(row["inception"]),
+                                      museum: label(row["collectionLabel"]), wikidata: q,
+                                      imageURL: row["img"].map(largeImage), link: row["article"] ?? httpsImage(item))
+            byItem[q] = (candidate, rank)
+        }
+        return byItem.values.sorted { $0.1 < $1.1 }.map(\.0)
+    }
+
+    /// Runs a Wikidata query, returning each row's values by name; nil if it couldn't be run.
+    static func sparql(_ query: String, timeout: TimeInterval) async -> [[String: String]]? {
         var components = URLComponents(string: "https://query.wikidata.org/sparql")!
         components.queryItems = [URLQueryItem(name: "query", value: query)]
         var request = URLRequest(url: components.url!)
         request.setValue("application/sparql-results+json", forHTTPHeaderField: "Accept")
         request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-        request.timeoutInterval = 30
-        guard let (data, _) = try? await URLSession.shared.data(for: request),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let rows = (json["results"] as? [String: Any])?["bindings"] as? [[String: Any]] else { return [] }
-
-        func value(_ row: [String: Any], _ key: String) -> String? { (row[key] as? [String: Any])?["value"] as? String }
-        /// Labels Wikidata couldn't name come back as IDs or blank-node links.
-        func label(_ s: String?) -> String? {
-            guard let s, !s.hasPrefix("http"), s.range(of: "^Q\\d+$", options: .regularExpression) == nil else { return nil }
-            return s
+        request.timeoutInterval = timeout
+        for attempt in 0..<2 {
+            if let (data, response) = try? await URLSession.shared.data(for: request),
+               (response as? HTTPURLResponse)?.statusCode == 200,
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let rows = (json["results"] as? [String: Any])?["bindings"] as? [[String: Any]] {
+                return rows.map { row in
+                    row.compactMapValues { ($0 as? [String: Any])?["value"] as? String }
+                }
+            }
+            try? await Task.sleep(nanoseconds: UInt64(3_000_000_000 * (attempt + 1)))
         }
-        var byItem: [String: (Candidate, Int)] = [:]
-        for (rowIndex, row) in rows.enumerated() {
-            guard let item = value(row, "item"), let title = label(value(row, "itemLabel")) else { continue }
-            let q = String(item.split(separator: "/").last ?? "")
-            let rank = order.flatMap { o in value(row, "mid").flatMap { o.firstIndex(of: $0) } } ?? rowIndex
-            if var existing = byItem[q] {
-                existing.0.museum = existing.0.museum ?? label(value(row, "collectionLabel"))
-                existing.1 = min(existing.1, rank)
-                byItem[q] = existing
-                continue
-            }
-            var image = value(row, "img")
-            if let i = image {
-                image = i.replacingOccurrences(of: "http://", with: "https://") + "?width=640"
-            }
-            let year = value(row, "inception").flatMap { s -> String? in
-                guard let m = s.range(of: "^-?\\d{1,4}", options: .regularExpression) else { return nil }
-                return String(s[m])
-            }
-            let candidate = Candidate(title: title, artist: label(value(row, "creatorLabel")), year: year,
-                                      museum: label(value(row, "collectionLabel")), wikidata: q, imageURL: image,
-                                      link: value(row, "article") ?? item.replacingOccurrences(of: "http://", with: "https://"))
-            byItem[q] = (candidate, rank)
-        }
-        return byItem.values.sorted { $0.1 < $1.1 }.map(\.0)
+        return nil
     }
+
+    /// A label, or nil for one Wikidata couldn't name (it then gives an ID or a blank-node link).
+    static func label(_ s: String?) -> String? {
+        guard let s, !s.isEmpty, !s.hasPrefix("http"), s.range(of: "^Q\\d+$", options: .regularExpression) == nil else { return nil }
+        return s
+    }
+
+    /// The year of a Wikidata date ("1851-01-01T00:00:00Z" → "1851").
+    static func year(_ s: String?) -> String? {
+        guard let s, let m = s.range(of: "^-?\\d{1,4}", options: .regularExpression) else { return nil }
+        return String(s[m])
+    }
+
+    static func httpsImage(_ s: String) -> String { s.replacingOccurrences(of: "http://", with: "https://") }
+
+    /// A work's Commons image at the size the on-device check was measured with.
+    static func largeImage(_ s: String) -> String { httpsImage(s) + "?width=960" }
 
     private static func sparqlEscape(_ s: String) -> String {
         s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
@@ -356,6 +493,24 @@ enum Identifier {
         return d
     }
 
+    /// A feature print's numbers, for searching many at once.
+    static func vector(of print: VNFeaturePrintObservation) -> [Float]? {
+        guard print.elementType == .float else { return nil }
+        return print.data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+    }
+
+    /// The feature print numbers of an image file's contents.
+    static func featurePrintVector(_ data: Data) -> [Float]? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceThumbnailMaxPixelSize: 1024,
+                kCGImageSourceCreateThumbnailWithTransform: true
+              ] as CFDictionary),
+              let print = featurePrint(image) else { return nil }
+        return vector(of: print)
+    }
+
     private static func remotePrint(_ urlString: String) async -> VNFeaturePrintObservation? {
         guard let url = URL(string: urlString) else { return nil }
         var request = URLRequest(url: url)
@@ -369,6 +524,26 @@ enum Identifier {
                 kCGImageSourceCreateThumbnailWithTransform: true
               ] as CFDictionary) else { return nil }
         return featurePrint(image)
+    }
+
+    // MARK: Reading text
+
+    /// The lines of text in a photo (a caption label, a sign), read on the device.
+    static func readText(imageData: Data) -> [String] {
+        guard let source = CGImageSourceCreateWithData(imageData as CFData, nil),
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceThumbnailMaxPixelSize: 2048,
+                kCGImageSourceCreateThumbnailWithTransform: true
+              ] as CFDictionary) else { return [] }
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = true
+        try? VNImageRequestHandler(cgImage: image).perform([request])
+        return (request.results ?? []).compactMap { observation in
+            guard let best = observation.topCandidates(1).first, best.confidence > 0.4 else { return nil }
+            return best.string
+        }
     }
 
     // MARK: Images
