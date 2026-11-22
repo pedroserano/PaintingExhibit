@@ -16,8 +16,9 @@ Mac app doesn't expire. It is signed with your free Apple Development certificat
 (set up by signing in to Xcode with your Apple account); otherwise it is signed ad-hoc and the Mac may ask
 for Photos access again after each rebuild.
 
-On the Mac: arrow keys or the side buttons move through a gallery, Space shows or hides the label,
-Esc closes the exhibit, pinch or double-click zooms, and ⌘, opens Settings.
+On the Mac (and iPad with a keyboard): in the gallery, arrow keys pick a painting and Return or Space opens it;
+in the exhibit, arrow keys or the side buttons move between paintings, Space shows or hides the label,
+Esc closes the exhibit and returns to that painting in the gallery, pinch or double-click zooms, and ⌘, opens Settings.
 
 ## iPhone and iPad: first run (free Apple account)
 

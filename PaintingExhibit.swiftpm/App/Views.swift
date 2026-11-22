@@ -135,10 +135,31 @@ struct GalleryView: View {
     @EnvironmentObject var library: Library
     @State private var selected: Painting?
     @State private var showSettings = false
+    /// The painting picked out with the arrow keys (Return or Space opens it).
+    @State private var highlighted: String?
+    @State private var columnCount = 1
+    @FocusState private var gridFocused: Bool
 
-    private let columns = [GridItem(.adaptive(minimum: 150), spacing: 12)]
+    private static let minimumWidth: CGFloat = 150, spacing: CGFloat = 12
+    private let columns = [GridItem(.adaptive(minimum: GalleryView.minimumWidth), spacing: GalleryView.spacing)]
+
+    private func open(_ painting: Painting) {
+        highlighted = painting.id
+        selected = painting
+    }
+
+    /// Moves the highlight by `delta` paintings (a whole row for up and down).
+    private func move(_ delta: Int) -> KeyPress.Result {
+        let ids = library.paintings.map(\.id)
+        guard !ids.isEmpty else { return .ignored }
+        let now = highlighted.flatMap { ids.firstIndex(of: $0) }
+        let next = now.map { min(max($0 + delta, 0), ids.count - 1) } ?? 0
+        highlighted = ids[next]
+        return .handled
+    }
 
     var body: some View {
+        ScrollViewReader { proxy in
         ScrollView {
             if library.isProcessing {
                 ProgressView(value: Double(library.progressDone), total: Double(max(library.progressTotal, 1))) {
@@ -155,15 +176,47 @@ struct GalleryView: View {
                                        description: Text("Add photos to the album and they'll appear here."))
                     .padding(.top, 80)
             }
-            LazyVGrid(columns: columns, spacing: 12) {
+            LazyVGrid(columns: columns, spacing: Self.spacing) {
                 ForEach(library.paintings) { painting in
-                    Button { selected = painting } label: {
+                    Button { open(painting) } label: {
                         Thumbnail(painting: painting)
+                            .overlay {
+                                if highlighted == painting.id {
+                                    RoundedRectangle(cornerRadius: 6).strokeBorder(Color.accentColor, lineWidth: 3)
+                                }
+                            }
                     }
                     .buttonStyle(.plain)
+                    .focusable(false)
+                    .id(painting.id)
                 }
             }
             .padding()
+            .background {
+                // How many thumbnails fit across, so up and down move a whole row.
+                GeometryReader { geo in
+                    Color.clear
+                        .onAppear { columnCount = Self.columns(for: geo.size.width) }
+                        .onChange(of: geo.size.width) { _, width in columnCount = Self.columns(for: width) }
+                }
+            }
+        }
+        .focusable()
+        .focusEffectDisabled()
+        .focused($gridFocused)
+        .onKeyPress(.leftArrow) { move(-1) }
+        .onKeyPress(.rightArrow) { move(1) }
+        .onKeyPress(.upArrow) { move(-columnCount) }
+        .onKeyPress(.downArrow) { move(columnCount) }
+        .onKeyPress(.return) { openHighlighted() }
+        .onKeyPress(.space) { openHighlighted() }
+        .onChange(of: highlighted) { _, id in
+            if let id { withAnimation { proxy.scrollTo(id) } }
+        }
+        .onAppear { gridFocused = true }
+        .onChange(of: selected) { _, painting in
+            if painting == nil { gridFocused = true }
+        }
         }
         .navigationTitle(library.albumTitle ?? "Exhibit")
         .toolbar {
@@ -198,16 +251,28 @@ struct GalleryView: View {
             }
         }
         .fullScreenCover(item: $selected) { painting in
-            ExhibitView(startID: painting.id) { selected = nil }
+            ExhibitView(startID: painting.id) { last in highlighted = last; selected = nil }
                 .environmentObject(library)
         }
         #else
         .overlay {
             if let painting = selected {
-                ExhibitView(startID: painting.id) { selected = nil }
+                ExhibitView(startID: painting.id) { last in highlighted = last; selected = nil }
             }
         }
         #endif
+    }
+
+    private func openHighlighted() -> KeyPress.Result {
+        guard let id = highlighted, let painting = library.paintings.first(where: { $0.id == id }) else {
+            return move(0)
+        }
+        open(painting)
+        return .handled
+    }
+
+    private static func columns(for width: CGFloat) -> Int {
+        max(1, Int((width - 32 + spacing) / (minimumWidth + spacing)))
     }
 }
 
@@ -245,12 +310,16 @@ struct ExhibitView: View {
     @State private var current: String
     @State private var showLabel = true
     @State private var adjusting: Painting?
-    let close: () -> Void
+    @FocusState private var focused: Bool
+    /// Closes the exhibit, passing the painting it ended on.
+    let onClose: (String) -> Void
 
-    init(startID: String, close: @escaping () -> Void) {
+    init(startID: String, close: @escaping (String) -> Void) {
         _current = State(initialValue: startID)
-        self.close = close
+        self.onClose = close
     }
+
+    private func close() { onClose(current) }
 
     private var currentPainting: Painting? {
         library.paintings.first { $0.id == current }
@@ -268,6 +337,21 @@ struct ExhibitView: View {
                 controls.transition(.opacity)
             }
         }
+        // Arrow keys move between paintings, Space shows or hides the label, Escape closes. The exhibit keeps
+        // keyboard focus, taking it back after a button is used or the crop editor closes.
+        .focusable()
+        .focusEffectDisabled()
+        .focused($focused)
+        .onKeyPress(.leftArrow) { step(-1); return .handled }
+        .onKeyPress(.rightArrow) { step(1); return .handled }
+        .onKeyPress(.upArrow) { step(-1); return .handled }
+        .onKeyPress(.downArrow) { step(1); return .handled }
+        .onKeyPress(.escape) { close(); return .handled }
+        .onKeyPress(.space) { toggleLabel(); return .handled }
+        .onAppear { focused = true }
+        .onChange(of: current) { focused = true }
+        .onChange(of: showLabel) { focused = true }
+        .onChange(of: adjusting) { _, editing in if editing == nil { focused = true } }
         #if os(iOS)
         .statusBarHidden()
         .fullScreenCover(item: $adjusting) { painting in
@@ -278,12 +362,19 @@ struct ExhibitView: View {
             CropEditor(painting: painting) { adjusting = nil }
                 .frame(minWidth: 760, minHeight: 620)
         }
-        .focusable()
-        .focusEffectDisabled()
-        .onKeyPress(.leftArrow) { step(-1); return .handled }
-        .onKeyPress(.rightArrow) { step(1); return .handled }
-        .onKeyPress(.escape) { close(); return .handled }
-        .onKeyPress(.space) { toggleLabel(); return .handled }
+        #endif
+    }
+
+    private var index: Int? { library.paintings.firstIndex { $0.id == current } }
+
+    private func step(_ delta: Int) {
+        guard let i = index else { return }
+        let next = i + delta
+        guard library.paintings.indices.contains(next) else { return }
+        #if os(iOS)
+        withAnimation { current = library.paintings[next].id }
+        #else
+        current = library.paintings[next].id
         #endif
     }
 
@@ -316,6 +407,7 @@ struct ExhibitView: View {
                         .disabled(index == nil || index == library.paintings.count - 1)
                 }
                 .buttonStyle(.plain)
+                .focusable(false)
                 .font(.system(size: 34, weight: .light))
                 .foregroundStyle(.white.opacity(0.8))
                 .padding(.horizontal, 20)
@@ -323,14 +415,6 @@ struct ExhibitView: View {
         }
     }
 
-    private var index: Int? { library.paintings.firstIndex { $0.id == current } }
-
-    private func step(_ delta: Int) {
-        guard let i = index else { return }
-        let next = i + delta
-        guard library.paintings.indices.contains(next) else { return }
-        current = library.paintings[next].id
-    }
     #endif
 
     private var controls: some View {
@@ -343,6 +427,7 @@ struct ExhibitView: View {
                         .font(.subheadline)
                 }
                 .buttonStyle(.bordered)
+                .focusable(false)
                 .tint(.white)
             }
             if let painting = currentPainting, painting.settings.frameFound, painting.manualCrop == nil {
@@ -354,6 +439,7 @@ struct ExhibitView: View {
                         .font(.subheadline)
                 }
                 .buttonStyle(.bordered)
+                .focusable(false)
                 .tint(.white)
             }
             Spacer()
