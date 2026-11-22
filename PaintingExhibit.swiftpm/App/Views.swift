@@ -371,13 +371,7 @@ struct ExhibitView: View {
     }
 
     var body: some View {
-        ZStack(alignment: .top) {
-            Color.black.ignoresSafeArea()
-            pages
-            if showLabel {
-                controls.transition(.opacity)
-            }
-        }
+        layout
         // Arrow keys move between paintings, Space shows or hides the label, Escape closes. The exhibit keeps
         // keyboard focus, taking it back after a button is used or the crop editor closes.
         .focusable()
@@ -429,6 +423,37 @@ struct ExhibitView: View {
         }
         #endif
     }
+
+    #if os(macOS)
+    /// On the Mac the buttons, painting and caption are stacked, never overlapping: the painting gets the space
+    /// between the bars, and all of the window when Space hides them.
+    private var layout: some View {
+        VStack(spacing: 0) {
+            if showLabel {
+                controls
+                    .background(.bar)
+                Divider()
+            }
+            pages
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color.black)
+            if showLabel, let painting = currentPainting {
+                Divider()
+                CaptionBar(painting: painting, keepsFrame: library.keepsFrame(painting))
+            }
+        }
+    }
+    #else
+    private var layout: some View {
+        ZStack(alignment: .top) {
+            Color.black.ignoresSafeArea()
+            pages
+            if showLabel {
+                controls.transition(.opacity)
+            }
+        }
+    }
+    #endif
 
     private var index: Int? { list.firstIndex { $0.id == current } }
 
@@ -483,63 +508,30 @@ struct ExhibitView: View {
     #endif
 
     private var controls: some View {
-        HStack {
-            if let painting = currentPainting {
-                Button {
-                    adjusting = painting
-                } label: {
-                    Label("Adjust Crop", systemImage: "crop.rotate")
-                        .font(.subheadline)
-                }
-                .buttonStyle(.bordered)
-                .focusable(false)
-                .tint(.white)
+        HStack(spacing: 8) {
+            #if os(macOS)
+            Button(action: close) {
+                Label("Gallery", systemImage: "chevron.left")
             }
+            .keyboardShortcut(.cancelAction)
+            .help("Back to the gallery (Esc)")
+            Divider().frame(height: 18)
+            #endif
             if let painting = currentPainting {
-                Button {
-                    colouring = painting
-                } label: {
-                    Label("White Balance", systemImage: "eyedropper.halffull")
-                        .font(.subheadline)
+                barButton("Adjust Crop", "crop.rotate") { adjusting = painting }
+                barButton("White Balance", "eyedropper.halffull") { colouring = painting }
+                if painting.settings.frameFound, painting.manualCrop == nil {
+                    let keeps = library.keepsFrame(painting)
+                    barButton(keeps ? "Remove Frame" : "Show Frame", keeps ? "crop" : "square.dashed") {
+                        library.setKeepFrame(!keeps, for: painting.id)
+                    }
                 }
-                .buttonStyle(.bordered)
-                .focusable(false)
-                .tint(.white)
-            }
-            if let painting = currentPainting, painting.settings.frameFound, painting.manualCrop == nil {
-                let keeps = library.keepsFrame(painting)
-                Button {
-                    library.setKeepFrame(!keeps, for: painting.id)
-                } label: {
-                    Label(keeps ? "Remove frame" : "Show frame", systemImage: keeps ? "crop" : "square.dashed")
-                        .font(.subheadline)
-                }
-                .buttonStyle(.bordered)
-                .focusable(false)
-                .tint(.white)
-            }
-            if let painting = currentPainting {
-                Button {
-                    identifying = painting
-                } label: {
-                    Label(painting.identification == nil ? "Identify" : "Details", systemImage: "magnifyingglass")
-                        .font(.subheadline)
-                }
-                .buttonStyle(.bordered)
-                .focusable(false)
-                .tint(.white)
-                Button {
-                    lookingUp = painting
-                } label: {
-                    Label("Look Up", systemImage: "info.circle")
-                        .font(.subheadline)
-                }
-                .buttonStyle(.bordered)
-                .focusable(false)
-                .tint(.white)
-                .help("Apple's Visual Look Up")
+                barButton(painting.identification == nil ? "Identify" : "Details", "magnifyingglass") { identifying = painting }
+                barButton("Look Up", "info.circle") { lookingUp = painting }
+                    .help("Apple's Visual Look Up")
             }
             Spacer()
+            #if os(iOS)
             Button(action: close) {
                 Image(systemName: "xmark.circle.fill")
                     .font(.title)
@@ -548,8 +540,29 @@ struct ExhibitView: View {
             }
             .buttonStyle(.plain)
             .keyboardShortcut(.cancelAction)
+            #endif
         }
+        #if os(macOS)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        #else
         .padding()
+        #endif
+    }
+
+    /// A button in the exhibit's bar: standard on the Mac, white over the painting on iPhone and iPad.
+    private func barButton(_ title: String, _ symbol: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: symbol)
+                #if os(iOS)
+                .font(.subheadline)
+                #endif
+        }
+        .buttonStyle(.bordered)
+        .focusable(false)
+        #if os(iOS)
+        .tint(.white)
+        #endif
     }
 }
 
@@ -565,17 +578,23 @@ struct PaintingPage: View {
     var body: some View {
         ZStack(alignment: .bottom) {
             if let image {
+                #if os(iOS)
                 ZoomableImage(image: image, onTap: toggleLabel, onZoomChange: { zoomed = $0 })
                     .ignoresSafeArea()
+                #else
+                ZoomableImage(image: image, onTap: toggleLabel, onZoomChange: { zoomed = $0 })
+                #endif
             } else {
                 ProgressView()
             }
 
+            #if os(iOS)
             if showLabel && !zoomed {
                 WallLabel(painting: painting, keepsFrame: library.keepsFrame(painting))
                     .padding(.bottom, 32)
                     .transition(.opacity)
             }
+            #endif
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .task(id: painting.renderedAt) {
@@ -585,47 +604,31 @@ struct PaintingPage: View {
     }
 }
 
-/// A museum-style caption. In phase 1 it shows only what the photo itself knows,
-/// plus what the processing did, to help tune the results.
-struct WallLabel: View {
+/// What a painting's caption says: what it is (once identified), when it was photographed, and what the
+/// processing did.
+struct CaptionText {
     let painting: Painting
     let keepsFrame: Bool
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            if let id = painting.identification, id.isIdentified, let title = id.title {
-                Text(title)
-                    .font(.system(.headline, design: .serif)).italic()
-                let line = [id.artist, id.year].compactMap { $0 }.joined(separator: ", ")
-                if !line.isEmpty {
-                    Text(line).font(.system(.subheadline, design: .serif))
-                }
-                if let museum = id.museum {
-                    Text(museum).font(.system(.footnote, design: .serif))
-                }
-            } else {
-                Text(painting.identification == nil ? "Not yet identified" : "Unidentified")
-                    .font(.system(.headline, design: .serif))
-                if let museum = painting.identification?.museums.first {
-                    Text("Seen at \(museum)").font(.system(.footnote, design: .serif))
-                }
-            }
-            if let date = painting.takenAt {
-                Text("Photographed \(date.formatted(date: .long, time: .omitted))")
-                    .font(.system(.subheadline, design: .serif))
-            }
-            Text(processingSummary)
-                .font(.caption)
-                .foregroundStyle(.black.opacity(0.55))
-        }
-        .foregroundStyle(.black)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-        .background(Color(white: 0.96), in: RoundedRectangle(cornerRadius: 3))
-        .shadow(radius: 6)
+    private var identity: Identification? { painting.identification }
+    var isIdentified: Bool { identity?.isIdentified == true && identity?.title != nil }
+    var title: String {
+        if isIdentified, let title = identity?.title { return title }
+        return identity == nil ? "Not yet identified" : "Unidentified"
     }
-
-    private var processingSummary: String {
+    var byline: String? {
+        guard isIdentified, let id = identity else { return nil }
+        let line = [id.artist, id.year].compactMap { $0 }.joined(separator: ", ")
+        return line.isEmpty ? nil : line
+    }
+    var place: String? {
+        if isIdentified, let museum = identity?.museum { return museum }
+        return identity?.museums.first.map { "Seen at \($0)" }
+    }
+    var photographed: String? {
+        painting.takenAt.map { "Photographed \($0.formatted(date: .long, time: .omitted))" }
+    }
+    var summary: String {
         let s = painting.settings
         var parts: [String] = []
         if painting.manualCrop != nil {
@@ -642,13 +645,77 @@ struct WallLabel: View {
         if s.colour != nil { parts.append("white balance set by hand") }
         if painting.photosRecipe != nil { parts.append("saved to Photos") }
         if keepsFrame != s.keptFrame && painting.manualCrop == nil { parts.append("updating…") }
-        switch painting.identification?.status {
+        switch identity?.status {
         case .matched?: parts.append("identified")
         case .possible?: parts.append("possible match, to check")
         case .confirmed?: parts.append("identity confirmed")
         default: break
         }
         return parts.joined(separator: " · ")
+    }
+}
+
+/// A museum-style wall label over the painting, on iPhone and iPad (tap the painting to hide it).
+struct WallLabel: View {
+    let painting: Painting
+    let keepsFrame: Bool
+
+    var body: some View {
+        let text = CaptionText(painting: painting, keepsFrame: keepsFrame)
+        VStack(alignment: .leading, spacing: 4) {
+            Text(text.title)
+                .font(.system(.headline, design: .serif))
+                .italic(text.isIdentified)
+            if let byline = text.byline { Text(byline).font(.system(.subheadline, design: .serif)) }
+            if let place = text.place { Text(place).font(.system(.footnote, design: .serif)) }
+            if let photographed = text.photographed { Text(photographed).font(.system(.subheadline, design: .serif)) }
+            Text(text.summary)
+                .font(.caption)
+                .foregroundStyle(.black.opacity(0.55))
+        }
+        .foregroundStyle(.black)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(Color(white: 0.96), in: RoundedRectangle(cornerRadius: 3))
+        .shadow(radius: 6)
+    }
+}
+
+/// The caption on the Mac: a bar below the painting in the system's style, never covering it.
+struct CaptionBar: View {
+    let painting: Painting
+    let keepsFrame: Bool
+
+    var body: some View {
+        let text = CaptionText(painting: painting, keepsFrame: keepsFrame)
+        HStack(alignment: .center, spacing: 16) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(text.title)
+                        .font(.headline)
+                        .italic(text.isIdentified)
+                    if let byline = text.byline {
+                        Text(byline).font(.subheadline).foregroundStyle(.secondary)
+                    }
+                }
+                if let place = text.place {
+                    Text(place).font(.subheadline).foregroundStyle(.secondary)
+                }
+            }
+            .lineLimit(1)
+            Spacer(minLength: 12)
+            VStack(alignment: .trailing, spacing: 2) {
+                if let photographed = text.photographed {
+                    Text(photographed).font(.caption).foregroundStyle(.secondary)
+                }
+                Text(text.summary).font(.caption).foregroundStyle(.tertiary)
+            }
+            .lineLimit(1)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity)
+        .background(.bar)
     }
 }
 
@@ -887,7 +954,7 @@ final class FittingScrollView: NSScrollView {
             laidOutSize = bounds.size
             magnification = 1
             onMagnify?(1)
-            let available = CGSize(width: max(1, bounds.width - 2 * margin), height: max(1, bounds.height - 2 * margin))
+            let available = CGSize(width: max(1, bounds.width - 2 * (margin + 32)), height: max(1, bounds.height - 2 * margin))
             let w = CGFloat(image.width), h = CGFloat(image.height)
             let fit = min(available.width / w, available.height / h)
             imageView.frame = CGRect(x: 0, y: 0, width: w * fit, height: h * fit)
