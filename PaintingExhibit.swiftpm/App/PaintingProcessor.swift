@@ -3,6 +3,7 @@ import CoreImage
 import CoreGraphics
 import ImageIO
 import Vision
+import simd
 import UniformTypeIdentifiers
 
 enum ProcessingError: LocalizedError {
@@ -28,6 +29,9 @@ struct NormPoint: Codable, Hashable {
 struct ProcessingSettings: Codable, Hashable {
     /// The painting (outer frame edge) in the photo: top-left, top-right, bottom-right, bottom-left.
     var paintingQuad: [NormPoint]?
+    /// Lens distortion found in the photo and undone before anything else (division model, radius relative to
+    /// half the photo's diagonal). Negative: barrel, as from a fish-eye or wide-angle lens. Nil: none found.
+    var lensK: Double?
     /// The painting's true width ÷ height, worked out from the corners and the lens, so a painting
     /// photographed from one side or from below isn't squashed. Nil: use the corners' own shape.
     var aspect: Double?
@@ -89,8 +93,12 @@ enum PaintingProcessor {
     /// Works out the recipe for a photo, draws the painting with it and writes the image to `url`.
     /// Returns the recipe, with the exposure it settled on filled in.
     static func analyzeAndRender(imageData: Data, keepFrame: Bool, writeTo url: URL) throws -> ProcessingSettings {
-        let (base, baseCG) = try prepare(imageData)
-        let settings = analyze(base: base, baseCG: baseCG, keepFrame: keepFrame, focal35: focalLength35(of: imageData))
+        var (base, baseCG) = try prepare(imageData)
+        // Straighten bent lines first: the frame is found and cropped far more reliably once its edges are straight.
+        let lensK = estimateLens(in: baseCG)
+        if let lensK, let undone = undistort(base, k: lensK) { (base, baseCG) = undone }
+        var settings = analyze(base: base, baseCG: baseCG, keepFrame: keepFrame, focal35: lensK == nil ? focalLength35(of: imageData) : nil)
+        settings.lensK = lensK
         return try render(base: base, settings: settings, writeTo: url)
     }
 
@@ -103,7 +111,8 @@ enum PaintingProcessor {
         maxDimension: CGFloat = PaintingProcessor.maxDimension,
         writeTo url: URL
     ) throws -> ProcessingSettings {
-        let (base, _) = try prepare(imageData, maxDimension: maxDimension)
+        var (base, _) = try prepare(imageData, maxDimension: maxDimension)
+        if let k = settings.lensK, let undone = undistort(base, k: k) { base = undone.0 }
         return try render(base: base, settings: settings, writeTo: url)
     }
 
@@ -127,6 +136,175 @@ enum PaintingProcessor {
         return (CIImage(cgImage: baseCG), baseCG)
     }
 
+    // MARK: Lens distortion
+
+    /// Finds barrel (fish-eye) or pincushion distortion from straight edges near the photo's sides, where a
+    /// painting's frame usually runs: those edges are straight in reality. Points where the colour changes sharply
+    /// are collected in the outer part of each side; the correction under which the most of them line up along
+    /// each side (allowing for some tilt) wins. Nothing needs to be found first, since bent edges defeat that.
+    /// Nil when the edges are already straight (most phone photos, whose camera corrects its lens) or unclear.
+    private static func estimateLens(in image: CGImage) -> Double? {
+        let scale = min(1, 800 / CGFloat(max(image.width, image.height)))
+        let w = Int(CGFloat(image.width) * scale), h = Int(CGFloat(image.height) * scale)
+        guard w >= 200, h >= 200,
+              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: sRGB,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        guard let small = ctx.makeImage(), let px = Pixels(small) else { return nil }
+
+        // Edge points per side, as (depth in from the side, position along it) in pixels.
+        let positions = 48
+        var sides: [[SIMD2<Double>]] = []
+        for side in 0..<4 {
+            let vertical = side < 2                       // left and right edges run vertically
+            let length = vertical ? h : w, across = vertical ? w : h
+            func colour(_ d: Int, _ a: Int) -> SIMD3<Float> {
+                switch side {
+                case 0: return px.at(d, a)
+                case 1: return px.at(w - 1 - d, a)
+                case 2: return px.at(a, d)
+                default: return px.at(a, h - 1 - d)
+                }
+            }
+            var points: [SIMD2<Double>] = []
+            let maxDepth = across * 35 / 100
+            for k in 0..<positions {
+                let a = length * (5 + 90 * k / (positions - 1)) / 100
+                var change = [Float](repeating: 0, count: maxDepth)
+                for d in 3..<(maxDepth - 3) {
+                    var diff = SIMD3<Float>(repeating: 0)
+                    for t in -1...1 { diff += abs(colour(d + 2, a + t) - colour(d - 2, a + t)) }
+                    change[d] = (diff.x + diff.y + diff.z) / 9
+                }
+                var peaks: [(Int, Float)] = []
+                for d in 4..<(maxDepth - 4) where change[d] >= 0.06 && change[d] >= change[d - 1] && change[d] > change[d + 1] {
+                    peaks.append((d, change[d]))
+                }
+                for (d, _) in peaks.sorted(by: { $0.1 > $1.1 }).prefix(6) {
+                    let p: SIMD2<Double>
+                    switch side {
+                    case 0: p = SIMD2(Double(d), Double(a))
+                    case 1: p = SIMD2(Double(w - 1 - d), Double(a))
+                    case 2: p = SIMD2(Double(a), Double(d))
+                    default: p = SIMD2(Double(a), Double(h - 1 - d))
+                    }
+                    points.append(p)
+                }
+            }
+            sides.append(points)
+        }
+
+        // For a correction k: on each side, the most points lying within a pixel and a half of one line
+        // (lines running roughly along that side, up to 12° off).
+        let centre = SIMD2(Double(w) / 2, Double(h) / 2), radius = hypot(Double(w), Double(h)) / 2
+        let angles = stride(from: -12.0, through: 12.0, by: 0.5).map { $0 * .pi / 180 }
+        func support(_ k: Double) -> [Int] {
+            sides.enumerated().map { side, points in
+                let fixed = points.map { p -> SIMD2<Double> in
+                    let r = simd_length(p - centre) / radius
+                    return centre + (p - centre) / (1 + k * r * r)
+                }
+                var best = 0
+                for angle in angles {
+                    // Normal to a line running along this side, tilted by `angle`.
+                    let normal = side < 2 ? SIMD2(cos(angle), sin(angle)) : SIMD2(sin(angle), cos(angle))
+                    var bins = [Int: Int]()
+                    for p in fixed { bins[Int((simd_dot(p, normal) / 1.5).rounded(.down)), default: 0] += 1 }
+                    for (bin, count) in bins { best = max(best, count + (bins[bin + 1] ?? 0)) }
+                }
+                return best
+            }
+        }
+        let straight = support(0)
+        var best = (k: 0.0, total: straight.reduce(0, +), sides: straight)
+        // Barrel (fish-eye, wide-angle) up to strong; pincushion (some zoom lenses) only mild.
+        for step in -45...6 where step != 0 {
+            let k = Double(step) / 100
+            let s = support(k)
+            if s.reduce(0, +) > best.total { best = (k, s.reduce(0, +), s) }
+        }
+        // Only correct when clearly more of the edges line up than before.
+        let before = straight.reduce(0, +)
+        guard abs(best.k) >= 0.04, best.total - before >= 12, Double(best.total) >= Double(before) * 1.15 else { return nil }
+        return best.k
+    }
+
+    /// Undoes lens distortion `k` (see `estimateLens`). Barrel correction keeps the photo's size (losing a little at
+    /// the edges); pincushion correction shrinks it slightly so the corners stay filled.
+    static func undistort(_ image: CIImage, k: Double) -> (CIImage, CGImage)? {
+        let zoom = k > 0 ? 1 / (1 + k) : 1
+        return remap(image) { r in
+            // Output radius r (relative to the half-diagonal) comes from the distorted photo at this radius.
+            let ru = r * zoom
+            guard abs(k) > 1e-9, ru > 1e-9 else { return ru }
+            let discriminant = 1 - 4 * k * ru * ru
+            guard discriminant >= 0 else { return .infinity }
+            return (1 - discriminant.squareRoot()) / (2 * k * ru)
+        }
+    }
+
+    /// Bends a straight photo as lens distortion `k` would, zoomed so the corners stay filled (for testing
+    /// `estimateLens`; relative to the result, the distortion is k × zoom²).
+    static func distort(_ image: CIImage, k: Double) -> (CIImage, CGImage)? {
+        let zoom = k < 0 ? (1 - (1 - 4 * k).squareRoot()) / (2 * k) : 1
+        return remap(image) { r in r * zoom / (1 + k * r * r * zoom * zoom) }
+    }
+
+    /// Redraws the image so the pixel at radius r from the centre (relative to the half-diagonal) is taken from
+    /// radius `source(r)` in the original, with bilinear sampling.
+    private static func remap(_ image: CIImage, source: (Double) -> Double) -> (CIImage, CGImage)? {
+        guard let cg = context.createCGImage(image, from: image.extent.integral, format: .RGBA8, colorSpace: sRGB) else {
+            return nil
+        }
+        let w = cg.width, h = cg.height
+        var input = [UInt8](repeating: 0, count: w * h * 4)
+        let drawn = input.withUnsafeMutableBytes { buffer -> Bool in
+            guard let ctx = CGContext(data: buffer.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                      space: sRGB, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        guard drawn else { return nil }
+        var output = [UInt8](repeating: 0, count: w * h * 4)
+        let cx = Double(w) / 2, cy = Double(h) / 2, radius = hypot(cx, cy)
+        // The mapping depends only on the radius, so tabulate it.
+        let steps = 4096
+        let table = (0...steps).map { source(Double($0) / Double(steps) * 1.5) }
+        input.withUnsafeBufferPointer { src in
+            output.withUnsafeMutableBufferPointer { dst in
+                for y in 0..<h {
+                    let dy = (Double(y) + 0.5 - cy) / radius
+                    for x in 0..<w {
+                        let dx = (Double(x) + 0.5 - cx) / radius
+                        let r = (dx * dx + dy * dy).squareRoot()
+                        let position = min(r / 1.5, 1) * Double(steps)
+                        let i = min(Int(position), steps - 1), f = position - Double(i)
+                        let rs = table[i] * (1 - f) + table[i + 1] * f
+                        guard rs.isFinite else { continue }
+                        let ratio = r > 1e-9 ? rs / r : 1
+                        let sx = cx + dx * ratio * radius - 0.5, sy = cy + dy * ratio * radius - 0.5
+                        guard sx >= 0, sy >= 0, sx < Double(w - 1), sy < Double(h - 1) else { continue }
+                        let x0 = Int(sx), y0 = Int(sy), fx = sx - Double(x0), fy = sy - Double(y0)
+                        let o = (y * w + x) * 4, i00 = (y0 * w + x0) * 4, i01 = i00 + 4, i10 = i00 + w * 4, i11 = i10 + 4
+                        for c in 0..<4 {
+                            let top = Double(src[i00 + c]) * (1 - fx) + Double(src[i01 + c]) * fx
+                            let bottom = Double(src[i10 + c]) * (1 - fx) + Double(src[i11 + c]) * fx
+                            dst[o + c] = UInt8(min(255, max(0, (top * (1 - fy) + bottom * fy).rounded())))
+                        }
+                    }
+                }
+            }
+        }
+        guard let provider = CGDataProvider(data: Data(output) as CFData),
+              let result = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4, space: sRGB,
+                                   bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                                   provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent) else {
+            return nil
+        }
+        return (CIImage(cgImage: result), result)
+    }
+
     // MARK: Analysis
 
     /// The lens's focal length as a 35 mm-equivalent, from the photo's EXIF data.
@@ -147,8 +325,8 @@ enum PaintingProcessor {
             gainLeft: 1, gainRight: 1, gainTop: 1, gainBottom: 1
         )
 
-        // 1. Find the painting: a clear rectangle first, then the main flat object, then (for a close-up)
-        // the whole photo, if a frame can be found running along its edges. Thin strips are skipped: they are usually a band across the painting, not the painting.
+        // 1. Find the painting: a clear rectangle with wall around it first, then the main flat object, then
+        // (a close-up) the whole photo, if a frame can be found running along its edges. Thin strips are skipped: they are usually a band across the painting, not the painting.
         let size = base.extent.size
         let plausible: (CGFloat, CGPoint) -> Bool = { area, _ in area >= 0.08 }
         let pixels = smallPixels(base)
@@ -156,15 +334,34 @@ enum PaintingProcessor {
             guard let quad else { return nil }
             let ratio = naiveAspect(of: quad, in: size)
             guard ratio > 1 / 3.2, ratio < 3.2 else { return nil }
-            // A long, thin outline is more often a band across the painting, so it needs plain surroundings on every side.
+            // The painting usually fills most of the photo. A small outline is often a shape inside the painting
+            // (a window, a panel, a face), so it must have plain wall around nearly all of it; a long, thin one
+            // is often a band across the painting, so it needs bare wall on every side.
             let elongated = ratio > 2.2 || ratio < 1 / 2.2
-            if let pixels, !surroundingsLookPlain(quad, in: pixels, allSides: elongated) { return nil }
+            let small = area(of: quad) < 0.4
+            if let pixels {
+                let check: Bool
+                if elongated && small {
+                    check = surroundingsLookPlain(quad, in: pixels, strictness: .wallOnly, share: 1)
+                } else if small {
+                    check = surroundingsLookPlain(quad, in: pixels, strictness: .strict, share: 0.75)
+                } else {
+                    check = surroundingsLookPlain(quad, in: pixels, strictness: elongated ? .strict : .lenient,
+                                                  share: elongated ? 1 : 0.5)
+                }
+                if !check { return nil }
+            }
             return quad
         }
         let wholePhoto = [NormPoint(x: 0, y: 1), NormPoint(x: 1, y: 1), NormPoint(x: 1, y: 0), NormPoint(x: 0, y: 0)]
-        guard let quad = shaped(largestQuad(in: baseCG, minimumSize: 0.2, accept: plausible))
+        // Vision's largest rectangle, skipping lines on the wall (a panel or doorway around the painting). A smaller
+        // rectangle is only tried in place of a wall feature: one inside a rejected outline is part of the painting.
+        let rectangle = rectangles(in: baseCG, minimumSize: 0.2, accept: plausible)
+            .first { quad in pixels.map { !isWallFeature(quad, in: $0) } ?? true }
+            .flatMap(shaped)
+        guard let quad = rectangle
                 ?? shaped(documentQuad(in: baseCG))
-                // A close-up, with the frame running off the edges of the photo: the frame can still be found.
+                // Otherwise assume the painting fills the photo, with its frame near the edges or out of shot.
                 ?? (findCanvas(in: base) != nil ? wholePhoto : nil) else {
             return settings
         }
@@ -235,15 +432,15 @@ enum PaintingProcessor {
 
     // MARK: Finding the painting
 
-    /// The largest rectangle Vision finds that passes `accept(area, center)`, in normalized coordinates,
+    /// The rectangles Vision finds that pass `accept(area, center)`, largest first, in normalized coordinates,
     /// as top-left, top-right, bottom-right, bottom-left.
-    private static func largestQuad(
+    private static func rectangles(
         in image: CGImage,
         minimumSize: Float,
         confidence: Float = 0.4,
         tolerance: Float = 25,
         accept: (CGFloat, CGPoint) -> Bool
-    ) -> [NormPoint]? {
+    ) -> [[NormPoint]] {
         let request = VNDetectRectanglesRequest()
         request.minimumAspectRatio = 0.15
         request.maximumAspectRatio = 1.0
@@ -254,14 +451,14 @@ enum PaintingProcessor {
         do {
             try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
         } catch {
-            return nil
+            return []
         }
         let quads = (request.results ?? []).map { o in
             [o.topLeft, o.topRight, o.bottomRight, o.bottomLeft].map { NormPoint(x: Double($0.x), y: Double($0.y)) }
         }
         return quads
             .filter { accept(area(of: $0), center(of: $0)) }
-            .max { area(of: $0) < area(of: $1) }
+            .sorted { area(of: $0) > area(of: $1) }
     }
 
     /// Vision's document finder, as a fallback when no rectangle stands out: it picks out the main
@@ -387,8 +584,7 @@ enum PaintingProcessor {
             return found
         }
 
-        typealias Side = (length: Int, across: Int, sample: (Int, Int) -> SIMD3<Float>)
-        let sideReaders: [Side] = [
+        let sideReaders: [SideReader] = [
             (h, w, { d, a in pixel(d, a) }),             // left
             (h, w, { d, a in pixel(w - 1 - d, a) }),     // right
             (w, h, { d, a in pixel(a, d) }),             // top
@@ -445,12 +641,67 @@ enum PaintingProcessor {
         }
         guard depths.contains(where: { $0 > 0 }) else { return nil }
 
-        // Trim a hair more, so no sliver of the frame's lip is left.
-        let l = Double(depths[0] + 2) / Double(w), r = Double(depths[1] + 2) / Double(w)
-        let t = Double(depths[2] + 2) / Double(h), b = Double(depths[3] + 2) / Double(h)
-        guard l + r < 0.7, t + b < 0.7 else { return nil }
+        guard let quad = quad(depths: depths, sides: sideReaders, width: w, height: h) else { return nil }
+        let bb = boundingBox(of: quad)
+        guard bb.width > 0.3, bb.height > 0.3 else { return nil }
+        return quad
+    }
+
+    typealias SideReader = (length: Int, across: Int, sample: (Int, Int) -> SIMD3<Float>)
+
+    /// The quad bounded by an edge at `depths[i]` in from each side (left, right, top, bottom; 0 = the image's
+    /// own edge) of a `width` × `height` image. Each edge is refitted as a straight line that may lean slightly,
+    /// when a leaning line follows the edge better: a painting a little rotated or skewed is then straightened.
+    private static func quad(depths: [Int], sides: [SideReader], width w: Int, height h: Int) -> [NormPoint]? {
+        func fit(_ side: SideReader, near depth: Int) -> (Double, Double) {
+            let a = Double(side.length) * 0.2, b = Double(side.length) * 0.8
+            let reach = max(2, side.across * 2 / 100)
+            let samples = Array(stride(from: side.length / 10, to: side.length - side.length / 10, by: 3))
+            func contrast(_ atA: Int, _ atB: Int) -> Float {
+                var diffs = samples.map { t -> Float in
+                    let d = Int((Double(atA) + Double(atB - atA) * (Double(t) - a) / (b - a)).rounded())
+                    var o = SIMD3<Float>(repeating: 0), n = SIMD3<Float>(repeating: 0)
+                    for k in 1...3 { o += side.sample(d - k, t); n += side.sample(d + k - 1, t) }
+                    let diff = abs(o - n) / 3
+                    return (diff.x + diff.y + diff.z) / 3
+                }
+                diffs.sort()
+                return diffs[diffs.count / 2]
+            }
+            var best = (depth, depth, contrast(depth, depth))
+            for atA in max(4, depth - reach)...(depth + reach) {
+                for atB in max(4, depth - reach)...(depth + reach) where atA != atB {
+                    let c = contrast(atA, atB)
+                    if c > best.2 * 1.08 { best = (atA, atB, c) }
+                }
+            }
+            // The deeper end, plus a little more, so no sliver of the frame's lip is left at either end.
+            return (Double(best.0 + 2), Double(best.1 + 2))
+        }
+
+        typealias Line = (p: SIMD2<Double>, q: SIMD2<Double>)
+        var edges: [Line] = []
+        for (i, side) in sides.enumerated() {
+            let a = Double(side.length) * 0.2, b = Double(side.length) * 0.8
+            let (dA, dB) = depths[i] > 0 ? fit(side, near: depths[i]) : (0, 0)
+            switch i {
+            case 0: edges.append((SIMD2(dA, a), SIMD2(dB, b)))
+            case 1: edges.append((SIMD2(Double(w) - dA, a), SIMD2(Double(w) - dB, b)))
+            case 2: edges.append((SIMD2(a, dA), SIMD2(b, dB)))
+            default: edges.append((SIMD2(a, Double(h) - dA), SIMD2(b, Double(h) - dB)))
+            }
+        }
+        func meet(_ l: Line, _ m: Line) -> SIMD2<Double>? {
+            let d1 = l.q - l.p, d2 = m.q - m.p
+            let denominator = d1.x * d2.y - d1.y * d2.x
+            guard abs(denominator) > 1e-9 else { return nil }
+            let t = ((m.p.x - l.p.x) * d2.y - (m.p.y - l.p.y) * d2.x) / denominator
+            return l.p + d1 * t
+        }
+        guard let tl = meet(edges[2], edges[0]), let tr = meet(edges[2], edges[1]),
+              let br = meet(edges[3], edges[1]), let bl = meet(edges[3], edges[0]) else { return nil }
         // Bottom-left origin, as Vision gives quads: top-left, top-right, bottom-right, bottom-left.
-        return [NormPoint(x: l, y: 1 - t), NormPoint(x: 1 - r, y: 1 - t), NormPoint(x: 1 - r, y: b), NormPoint(x: l, y: b)]
+        return [tl, tr, br, bl].map { NormPoint(x: min(max($0.x / Double(w), 0), 1), y: min(max(1 - $0.y / Double(h), 0), 1)) }
     }
 
     private static func area(of quad: [NormPoint]) -> CGFloat {
@@ -495,8 +746,10 @@ enum PaintingProcessor {
 
     /// Whether what lies just outside the quad looks like wall or frame (plain along its length) rather than more
     /// painting. An outline found inside a painting has busy picture around it. Sides at the photo's edge are
-    /// skipped; at least half of the rest (or all, with `allSides`) must look plain.
-    private static func surroundingsLookPlain(_ quad: [NormPoint], in px: Pixels, allSides: Bool) -> Bool {
+    /// skipped; at least `share` of the rest must look plain.
+    enum Strictness { case lenient, strict, wallOnly }
+
+    private static func surroundingsLookPlain(_ quad: [NormPoint], in px: Pixels, strictness: Strictness, share: Double) -> Bool {
         let w = px.width, h = px.height
         let bb = boundingBox(of: quad)
         let x0 = Int(bb.minX * CGFloat(w)), x1 = Int(bb.maxX * CGFloat(w))
@@ -510,13 +763,48 @@ enum PaintingProcessor {
             let outside = busyness(length: length, from: 0, to: strip) { d, a in sample(-(d + gap), a) }
             let inside = busyness(length: length, from: 0, to: strip) { d, a in sample(d + gap, a) }
             checked += 1
-            if outside < 0.015 || outside < inside * 0.6 { plain += 1 }
+            switch strictness {
+            case .lenient: if outside < 0.015 || outside < inside * 0.6 { plain += 1 }
+            case .strict: if outside < 0.012 || outside < inside * 0.5 { plain += 1 }
+            case .wallOnly: if outside < 0.01 { plain += 1 }
+            }
         }
         check(length: y1 - y0, outsideRoom: x0 - gapX, strip: stripX, insideRoom: x1 - x0) { d, a in px.at(x0 + d, y0 + a) }
         check(length: y1 - y0, outsideRoom: w - x1 - gapX, strip: stripX, insideRoom: x1 - x0) { d, a in px.at(x1 - d, y0 + a) }
         check(length: x1 - x0, outsideRoom: y0 - gapY, strip: stripY, insideRoom: y1 - y0) { d, a in px.at(x0 + a, y0 + d) }
         check(length: x1 - x0, outsideRoom: h - y1 - gapY, strip: stripY, insideRoom: y1 - y0) { d, a in px.at(x0 + a, y1 - d) }
-        return checked == 0 || (allSides ? plain == checked : plain * 2 >= checked)
+        return checked == 0 || Double(plain) >= Double(checked) * share - 0.001
+    }
+
+    /// Whether the quad is a line on the wall rather than a painting's edge: on at least three sides, the strips
+    /// just inside and just outside are both plain and the same colour (the same wall on both sides).
+    private static func isWallFeature(_ quad: [NormPoint], in px: Pixels) -> Bool {
+        let w = px.width, h = px.height
+        let bb = boundingBox(of: quad)
+        let x0 = Int(bb.minX * CGFloat(w)), x1 = Int(bb.maxX * CGFloat(w))
+        let y0 = Int((1 - bb.maxY) * CGFloat(h)), y1 = Int((1 - bb.minY) * CGFloat(h)) // row 0 at the top
+        let strip = max(5, min(w, h) / 30), gap = max(2, strip / 2)
+        var sameWall = 0
+        func check(length: Int, room: Int, inside insideRoom: Int, sample: @escaping (Int, Int) -> SIMD3<Float>) {
+            // `sample(depth, along)`: depth 0 is the quad's edge, negative outward.
+            guard room >= strip + gap, insideRoom >= (strip + gap) * 2, length >= 40 else { return }
+            func band(_ sign: Int) -> (SIMD3<Float>, Float) {
+                let pick: (Int, Int) -> SIMD3<Float> = { d, a in sample(sign * (d + gap), a) }
+                var sum = SIMD3<Float>(repeating: 0), n: Float = 0
+                for d in stride(from: 0, to: strip, by: 2) {
+                    for a in stride(from: length / 10, to: length - length / 10, by: 3) { sum += pick(d, a); n += 1 }
+                }
+                return (sum / max(n, 1), busyness(length: length, from: 0, to: strip, sample: pick))
+            }
+            let (outColour, outBusy) = band(-1), (inColour, inBusy) = band(1)
+            let d = abs(outColour - inColour)
+            if outBusy < 0.01, inBusy < 0.01, (d.x + d.y + d.z) / 3 < 0.03 { sameWall += 1 }
+        }
+        check(length: y1 - y0, room: x0, inside: x1 - x0) { d, a in px.at(x0 + d, y0 + a) }
+        check(length: y1 - y0, room: w - x1, inside: x1 - x0) { d, a in px.at(x1 - d, y0 + a) }
+        check(length: x1 - x0, room: y0, inside: y1 - y0) { d, a in px.at(x0 + a, y0 + d) }
+        check(length: x1 - x0, room: h - y1, inside: y1 - y0) { d, a in px.at(x0 + a, y1 - d) }
+        return sameWall >= 3
     }
 
     /// Width ÷ height of the quad's sides as they appear in the photo.

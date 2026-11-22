@@ -27,7 +27,7 @@ struct Painting: Codable, Identifiable, Hashable {
 @MainActor
 final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     /// Bump this when the analysis changes, so older recipes are worked out again.
-    static let processingVersion = 5
+    static let processingVersion = 6
     /// Identifies this app's edits in Photos, so it can recognise and redo them.
     nonisolated static let adjustmentFormat = "com.pedroserano.PaintingExhibit.recipe"
     /// Long side of the photo when drawing an edit for Photos (the exhibit cache uses less).
