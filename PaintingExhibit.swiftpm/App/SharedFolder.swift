@@ -10,6 +10,10 @@ struct SharedEntry: Codable {
     var editedAt: Date?
     var identification: Identification?
     var identifiedAt: Date?
+    /// The finished recipe (crop, frame, lighting) and the processing version it was made with: another device
+    /// uses it instead of analysing the photo again, and only draws the image.
+    var recipe: ProcessingSettings?
+    var recipeVersion: Int?
 }
 
 /// A folder you choose (normally in iCloud Drive) that the app keeps its shareable data in, so the Mac, iPhone
@@ -135,6 +139,30 @@ struct ShareSettings: View {
             and each museum's paintings are fetched only once for all of them.
             """)
         }
+        .fileImporter(isPresented: $choosing, allowedContentTypes: [.folder]) { result in
+            if case .success(let url) = result { library.chooseSharedFolder(url) }
+        }
+    }
+}
+
+/// In the gallery until a shared folder is chosen: a quick way to share with your other devices.
+struct SharePrompt: View {
+    @EnvironmentObject var library: Library
+    @State private var choosing = false
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "icloud").font(.title3).foregroundStyle(.secondary)
+            Text("Using Painting Exhibit on another device? Choose the shared folder (iCloud Drive › Painting Exhibit) to use its crops, edits and identifications instead of redoing them.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            Button("Choose Shared Folder…") { choosing = true }
+                .buttonStyle(.bordered)
+        }
+        .padding(12)
+        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+        .padding(.horizontal)
         .fileImporter(isPresented: $choosing, allowedContentTypes: [.folder]) { result in
             if case .success(let url) = result { library.chooseSharedFolder(url) }
         }

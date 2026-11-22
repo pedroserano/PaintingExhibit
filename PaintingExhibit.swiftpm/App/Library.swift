@@ -209,6 +209,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                 if let at = ownWrites[id], Date().timeIntervalSince(at) < 120 { continue }
                 // Edited elsewhere (cropped, rotated, reverted in Photos, or by this app on another of your
                 // devices): analyse it again. Whose edit it now carries is checked before saving to Photos.
+                changedInPhotos.insert(id)
                 redrawLater(id)
             }
         }
@@ -250,6 +251,10 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
 
     @Published private(set) var sharedFolderName: String? = SharedFolder.displayName
     private var cloudIDs: [String: String] = [:]     // Photos ID on this device → iCloud Photos ID
+    /// The shared records as last read, by iCloud Photos ID.
+    private var sharedEntries: [String: SharedEntry] = [:]
+    /// Photos changed in Photos itself since the app started: analysed afresh, not from a shared recipe.
+    private var changedInPhotos: Set<String> = []
     private var syncing = false
     private var syncAgain = false
 
@@ -369,8 +374,16 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                     entry.identifiedAt = p.identifiedAt ?? mine.searchedAt
                     changedShared = true
                 }
+                // The finished recipe, for other devices to use instead of analysing the photo again.
+                if paintings[i].version == Self.processingVersion, !stale.contains(p.id),
+                   entry.recipeVersion != Self.processingVersion || entry.recipe == nil || mine > theirs {
+                    entry.recipe = paintings[i].settings
+                    entry.recipeVersion = Self.processingVersion
+                    changedShared = true
+                }
                 shared[key] = entry
             }
+            sharedEntries = shared
             save()
             if changedShared {
                 let encoder = JSONEncoder()
@@ -823,19 +836,42 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
 
         progressDone = 0
         progressTotal = todo.count
+        // Recipes your other devices already worked out are used instead of analysing again.
+        if SharedFolder.url != nil, !todo.isEmpty {
+            await syncShared()
+            _ = cloudID(todo.map { $0.0.localIdentifier })
+        }
         for (asset, job) in todo {
             let id = asset.localIdentifier
             do {
                 let data = try await Self.source(for: asset).data
                 let previous = paintings.first { $0.id == id }
-                let keep = previous?.keepFrame ?? keepFramesByDefault
+                // Another device's finished recipe for this photo, when it fits what's known here.
+                let shared = cloudIDs[id].flatMap { sharedEntries[$0] }
+                let adopted: SharedEntry? = {
+                    guard job == .analyze, let shared, shared.recipe != nil, shared.recipeVersion == Self.processingVersion,
+                          !changedInPhotos.contains(id) else { return nil }
+                    guard let previous else { return shared }                       // new on this device
+                    return (shared.editedAt ?? .distantPast) >= (previous.editedAt ?? .distantPast) ? shared : nil
+                }()
+                let keep = previous?.keepFrame ?? adopted?.keepFrame ?? keepFramesByDefault
                 let fileName = previous?.fileName ?? Self.fileName(for: id)
-                let manual = previous?.manualCrop
+                let manual = adopted != nil ? adopted?.manualCrop : previous?.manualCrop
                 let colour = previous?.settings.colour
                 let url = cacheFolder.appendingPathComponent(fileName)
 
                 let settings: ProcessingSettings
-                if job == .redraw, var recipe = previous?.settings {
+                if var recipe = adopted?.recipe {
+                    if recipe.keptFrame != keep {
+                        recipe.keptFrame = keep
+                        recipe.blackPoint = nil
+                        recipe.exposure = nil
+                    }
+                    let fixed = recipe
+                    settings = try await Task.detached(priority: .userInitiated) {
+                        try PaintingProcessor.render(imageData: data, settings: fixed, writeTo: url)
+                    }.value
+                } else if job == .redraw, var recipe = previous?.settings {
                     recipe.keptFrame = keep
                     recipe.blackPoint = nil     // the frame changes the brightness range
                     recipe.exposure = nil
@@ -864,9 +900,9 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                     photosLeftAlone: previous?.photosLeftAlone,
                     manualCrop: manual,
                     photoText: previous?.photoText,
-                    identification: previous?.identification,
-                    editedAt: previous?.editedAt,
-                    identifiedAt: previous?.identifiedAt
+                    identification: previous?.identification ?? adopted?.identification,
+                    editedAt: adopted != nil ? (adopted?.editedAt ?? previous?.editedAt) : previous?.editedAt,
+                    identifiedAt: previous?.identification != nil ? previous?.identifiedAt : adopted?.identifiedAt
                 )
                 if let i = paintings.firstIndex(where: { $0.id == id }) {
                     paintings[i] = painting

@@ -185,6 +185,9 @@ struct GalleryView: View {
                         "Possible matches to check: open each one and confirm it, choose another, or type the details.")
                     .font(.footnote).foregroundStyle(.secondary).padding(.horizontal)
             }
+            if library.sharedFolderName == nil {
+                SharePrompt()
+            }
             if let error = library.lastError {
                 Text(error).font(.footnote).foregroundStyle(.orange).padding(.horizontal)
             }
@@ -252,12 +255,15 @@ struct GalleryView: View {
                 Button("Check for new paintings", systemImage: "arrow.clockwise") {
                     Task { await library.processNew() }
                 }
+                .disabled(library.isProcessing)
                 Button("Reprocess all", systemImage: "wand.and.stars") {
                     Task { await library.processNew(reprocessAll: true) }
                 }
+                .disabled(library.isProcessing)
                 Button("Change album", systemImage: "rectangle.stack") {
                     library.albumID = nil
                 }
+                .disabled(library.isProcessing)
                 Button("Identify paintings", systemImage: "magnifyingglass") {
                     Task { await library.identifyPending(force: true) }
                 }
@@ -269,7 +275,6 @@ struct GalleryView: View {
             } label: {
                 Image(systemName: "ellipsis.circle")
             }
-            .disabled(library.isProcessing)
         }
         .refreshable { await library.processNew() }
         .task { await library.processNew() }
