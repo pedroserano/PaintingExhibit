@@ -250,6 +250,17 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     // MARK: Sharing between devices
 
     @Published private(set) var sharedFolderName: String? = SharedFolder.displayName
+    /// Until you choose a shared folder (or say this device works alone), nothing is processed: a device joining
+    /// later would otherwise redo, worse, what your other devices already did.
+    @Published private(set) var awaitingShareChoice =
+        SharedFolder.url == nil && !UserDefaults.standard.bool(forKey: "shareChoiceMade")
+
+    /// This device works on its own (it can still join a shared folder later).
+    func workAlone() {
+        UserDefaults.standard.set(true, forKey: "shareChoiceMade")
+        awaitingShareChoice = false
+        Task { await processNew() }
+    }
     private var cloudIDs: [String: String] = [:]     // Photos ID on this device → iCloud Photos ID
     /// The shared records as last read, by iCloud Photos ID.
     private var sharedEntries: [String: SharedEntry] = [:]
@@ -261,8 +272,19 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     /// Chooses the folder to share edits, identifications and museum data through (nil: stop sharing), and
     /// brings what's already there in.
     func chooseSharedFolder(_ url: URL?) {
+        let joining = SharedFolder.url == nil && url != nil
         SharedFolder.choose(url)
         sharedFolderName = SharedFolder.displayName
+        UserDefaults.standard.set(true, forKey: "shareChoiceMade")
+        awaitingShareChoice = false
+        if joining {
+            // Joining: what's in the folder outranks this device's own automatic work. Only what you did by hand
+            // here (a crop, white balance, frame choice, a confirmed identification) stays ahead.
+            for i in paintings.indices where paintings[i].identification?.status != .confirmed {
+                paintings[i].identifiedAt = .distantPast
+            }
+            save()
+        }
         if let url {
             // Carry over the crop fixes and museum data fetched so far, so nothing is fetched twice.
             let local = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -374,6 +396,19 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                     entry.identifiedAt = p.identifiedAt ?? mine.searchedAt
                     changedShared = true
                 }
+                // A recipe from the folder replaces this device's own automatic one (nothing done here by hand).
+                let handEdited = paintings[i].editedAt != nil || paintings[i].manualCrop != nil
+                    || paintings[i].settings.colour != nil || paintings[i].keepFrame != nil
+                if !handEdited, let recipe = entry.recipe, entry.recipeVersion == Self.processingVersion,
+                   paintings[i].version == Self.processingVersion, !changedInPhotos.contains(p.id),
+                   !recipe.looksSame(as: paintings[i].settings) {
+                    paintings[i].version = 0
+                    stale.insert(p.id)
+                    redraw = true
+                    shared[key] = entry
+                    continue
+                }
+
                 // The finished recipe, for other devices to use instead of analysing the photo again.
                 if paintings[i].version == Self.processingVersion, !stale.contains(p.id),
                    entry.recipeVersion != Self.processingVersion || entry.recipe == nil || mine > theirs {
@@ -519,7 +554,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
             anotherPass = true
             return
         }
-        guard authorized, albumID != nil else { return }
+        guard authorized, albumID != nil, !awaitingShareChoice else { return }
         isProcessing = true
         lastError = nil
         repeat {
@@ -548,7 +583,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     /// Looks up every painting not yet searched for, when automatic identification is on (or `force`), one at
     /// a time. Free sources come first (the caption label, the museum's collection); Google only with a key.
     func identifyPending(force: Bool = false) async {
-        guard identifyAutomatically || force, !isIdentifying else { return }
+        guard identifyAutomatically || force, !isIdentifying, !awaitingShareChoice else { return }
         // Paintings photographed close together first, so each museum's paintings are fetched once. Paintings
         // the search gave up on are searched again when it improves; matches confirmed by hand never are.
         let pending = paintings.filter { needsSearch($0) }

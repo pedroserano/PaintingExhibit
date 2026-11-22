@@ -185,7 +185,9 @@ struct GalleryView: View {
                         "Possible matches to check: open each one and confirm it, choose another, or type the details.")
                     .font(.footnote).foregroundStyle(.secondary).padding(.horizontal)
             }
-            if library.sharedFolderName == nil {
+            if library.awaitingShareChoice {
+                ShareChoice()
+            } else if library.sharedFolderName == nil {
                 SharePrompt()
             }
             if let error = library.lastError {

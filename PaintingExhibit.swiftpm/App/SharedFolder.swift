@@ -168,3 +168,31 @@ struct SharePrompt: View {
         }
     }
 }
+
+/// Before anything is processed on a device without a shared folder: share with your other devices, or work
+/// on this one alone.
+struct ShareChoice: View {
+    @EnvironmentObject var library: Library
+    @State private var choosing = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Before preparing your paintings", systemImage: "icloud").font(.headline)
+            Text("If you use Painting Exhibit on another device, choose the shared folder (iCloud Drive › Painting Exhibit) so this one uses the crops, edits and identifications already made there instead of redoing them.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            HStack {
+                Button("Choose Shared Folder…") { choosing = true }
+                    .buttonStyle(.borderedProminent)
+                Button("Not Now (prepare on this device)") { library.workAlone() }
+                    .buttonStyle(.bordered)
+            }
+        }
+        .padding(16)
+        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 12))
+        .padding()
+        .fileImporter(isPresented: $choosing, allowedContentTypes: [.folder]) { result in
+            if case .success(let url) = result { library.chooseSharedFolder(url) }
+        }
+    }
+}
