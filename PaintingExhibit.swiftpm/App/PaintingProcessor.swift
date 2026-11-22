@@ -386,8 +386,18 @@ enum PaintingProcessor {
         let size = base.extent.size
         let plausible: (CGFloat, CGPoint) -> Bool = { area, _ in area >= 0.08 }
         let pixels = smallPixels(base)
-        func shaped(_ quad: [NormPoint]?) -> [NormPoint]? {
-            guard let quad else { return nil }
+        // The detectors' outlines, each a witness for the others' corners.
+        let subject = subjectFinder(baseCG)
+        let document = documentQuad(in: baseCG)
+        let candidates = rectangles(in: baseCG, minimumSize: 0.2, accept: plausible)
+        let witnesses = [subject, candidates.first, document].compactMap { $0 }
+        func shaped(_ found: [NormPoint]?) -> [NormPoint]? {
+            guard let found else { return nil }
+            // A repaired corner must leave the painting with plain wall around it, or the outline was wrong
+            // throughout (a close-up whose bent edge crossed the painting itself).
+            let quad = unbent(found, in: size, witnesses: witnesses)
+            if quad != found, let pixels,
+               !surroundingsLookPlain(quad, in: pixels, strictness: .strict, share: 0.75) { return nil }
             let ratio = naiveAspect(of: quad, in: size)
             guard ratio > 1 / 3.2, ratio < 3.2 else { return nil }
             // The painting usually fills most of the photo. A small outline is often a shape inside the painting
@@ -412,13 +422,13 @@ enum PaintingProcessor {
         let wholePhoto = [NormPoint(x: 0, y: 1), NormPoint(x: 1, y: 1), NormPoint(x: 1, y: 0), NormPoint(x: 0, y: 0)]
         // Vision's largest rectangle, skipping lines on the wall (a panel or doorway around the painting). A smaller
         // rectangle is only tried in place of a wall feature: one inside a rejected outline is part of the painting.
-        let rectangle = rectangles(in: baseCG, minimumSize: 0.2, accept: plausible)
+        let rectangle = candidates
             .first { quad in pixels.map { !isWallFeature(quad, in: $0) } ?? true }
             .flatMap(shaped)
         guard var quad = forcedQuad
-                ?? subjectFinder(baseCG).flatMap(shaped)
+                ?? subject.flatMap(shaped)
                 ?? rectangle
-                ?? shaped(documentQuad(in: baseCG))
+                ?? shaped(document)
                 // Otherwise assume the painting fills the photo, with its frame near the edges or out of shot.
                 ?? (findCanvas(in: base) != nil ? wholePhoto : nil)
                 ?? straighten(wholePhoto, in: base) else {
@@ -428,8 +438,12 @@ enum PaintingProcessor {
         // a painting shot from below or one side) leaves the frame a trapezoid.
         for _ in 0..<(forcedQuad == nil ? 2 : 0) {
             // A painting is in the photo: a squaring that puts corners well outside it has followed the wrong lines.
+            // Moving one corner far while bending its edge out of line with the opposite one means it followed a line
+            // inside the painting.
             guard let squarer = straighten(quad, in: base),
                   squarer.allSatisfy({ $0.x > -0.02 && $0.x < 1.02 && $0.y > -0.02 && $0.y < 1.02 }) else { break }
+            let movedFar = quad == wholePhoto || zip(quad, squarer).contains { hypot($0.x - $1.x, $0.y - $1.y) > 0.08 }
+            if movedFar && unbent(squarer, in: size, witnesses: witnesses) != squarer { break }
             quad = squarer
         }
         settings.paintingQuad = quad
@@ -821,6 +835,16 @@ enum PaintingProcessor {
             break
         }
         var depths = best?.depths ?? [0, 0, 0, 0]
+        // A frame is about as wide on opposite sides (top and bottom less so: seen from below, and the bottom rail
+        // is often deeper). Lines lopsided far beyond that are the painting's own: trim both sides to the narrower.
+        for (a, b, ratio) in [(0, 1, 0.5), (2, 3, 0.3)] {
+            let da = Double(depths[a]) / Double(sideReaders[a].across), db = Double(depths[b]) / Double(sideReaders[b].across)
+            if max(da, db) > 0.05 && min(da, db) < max(da, db) * ratio {
+                let narrower = min(da, db)
+                depths[a] = Int(narrower * Double(sideReaders[a].across))
+                depths[b] = Int(narrower * Double(sideReaders[b].across))
+            }
+        }
 
         // A carved rail is as busy as a painting, so the checks above often stop at its outer mouldings. Its
         // colours give it away: going in from the edge, bands keep the rail's colour make-up until the canvas.
@@ -1140,6 +1164,49 @@ enum PaintingProcessor {
         let width = (length(quad[0], quad[1]) + length(quad[3], quad[2])) / 2
         let height = (length(quad[0], quad[3]) + length(quad[1], quad[2])) / 2
         return height > 0 ? width / height : 1
+    }
+
+    /// Repairs an outline with one corner snapped to something inside the painting. That bends one edge well off
+    /// level (or plumb) while the opposite edge stays true; seen in perspective, opposite edges lean together. The
+    /// bad corner is the bent edge's end on the shorter of its two neighbouring edges; it is rebuilt from the
+    /// other three, as a parallelogram. Returns the quad unchanged when it isn't bent that way, or when one of the
+    /// `witnesses` (other detectors' outlines) puts that corner in the same place: a painting photographed from far
+    /// to one side, level with one of its edges, really does look like that.
+    static func unbent(_ quad: [NormPoint], in size: CGSize, witnesses: [[NormPoint]] = []) -> [NormPoint] {
+        let p = quad.map { SIMD2<Double>($0.x * size.width, $0.y * size.height) } // TL, TR, BR, BL
+        func tilt(_ a: SIMD2<Double>, _ b: SIMD2<Double>, horizontal: Bool) -> Double {
+            let d = b - a
+            return abs(atan2(horizontal ? d.y : d.x, horizontal ? d.x : d.y)) * 180 / .pi
+        }
+        func length(_ a: SIMD2<Double>, _ b: SIMD2<Double>) -> Double { ((b - a) * (b - a)).sum().squareRoot() }
+        // Edges as (corner, corner): top, right, bottom, left.
+        let edges = [(0, 1), (1, 2), (3, 2), (0, 3)]
+        let tilts = edges.enumerated().map { i, e in
+            let t = tilt(p[e.0], p[e.1], horizontal: i % 2 == 0)
+            return min(t, 180 - t)
+        }
+        guard let worst = tilts.indices.max(by: { tilts[$0] < tilts[$1] }), tilts[worst] >= 7,
+              tilts[(worst + 2) % 4] < tilts[worst] * 0.35 else { return quad }
+        // The neighbours of the bent edge, each with the bent edge's corner it touches. A corner on the photo's
+        // edge is where the painting runs out of shot, not a snapped corner: leave that outline alone.
+        let (a, b) = edges[worst]
+        func onBorder(_ n: NormPoint) -> Bool { min(n.x, n.y, 1 - n.x, 1 - n.y) < 0.01 }
+        guard !onBorder(quad[a]), !onBorder(quad[b]) else { return quad }
+        let neighbours = edges.filter { $0 != edges[worst] && $0 != edges[(worst + 2) % 4] }
+        let atA = neighbours.first { $0.0 == a || $0.1 == a }!, atB = neighbours.first { $0.0 == b || $0.1 == b }!
+        let bad = length(p[atA.0], p[atA.1]) < length(p[atB.0], p[atB.1]) ? a : b
+        let confirmed = witnesses.contains { w in
+            w != quad && hypot(w[bad].x - quad[bad].x, w[bad].y - quad[bad].y) < 0.07
+        }
+        guard !confirmed else { return quad }
+        // A parallelogram's corner: the sum of its two neighbours less the opposite corner.
+        let opposite = (bad + 2) % 4
+        let fixed = p[(bad + 1) % 4] + p[(bad + 3) % 4] - p[opposite]
+        guard fixed.x > -0.05 * size.width, fixed.x < 1.05 * size.width,
+              fixed.y > -0.05 * size.height, fixed.y < 1.05 * size.height else { return quad }
+        var out = quad
+        out[bad] = NormPoint(x: min(max(fixed.x / size.width, 0), 1), y: min(max(fixed.y / size.height, 0), 1))
+        return out
     }
 
     /// The painting's real width ÷ height. A rectangle seen at an angle looks narrower than it is; knowing the
