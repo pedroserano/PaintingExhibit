@@ -339,7 +339,8 @@ struct ExhibitView: View {
     @State private var current: String
     @State private var showLabel = true
     @State private var adjusting: Painting?
-    @State private var identifying: Painting?
+    /// Whether the details panel is open beside the painting (remembered).
+    @AppStorage("showDetails") private var showDetails = false
     @State private var lookingUp: Painting?
     @State private var colouring: Painting?
     @FocusState private var focused: Bool
@@ -387,7 +388,6 @@ struct ExhibitView: View {
         .onChange(of: current) { focused = true }
         .onChange(of: showLabel) { focused = true }
         .onChange(of: adjusting) { _, editing in if editing == nil { focused = true } }
-        .onChange(of: identifying) { _, open in if open == nil { focused = true } }
         .onChange(of: lookingUp) { _, open in if open == nil { focused = true } }
         .onChange(of: colouring) { _, open in if open == nil { focused = true } }
         .sheet(item: $colouring) { painting in
@@ -404,12 +404,10 @@ struct ExhibitView: View {
                 .frame(minWidth: 700, minHeight: 600)
                 #endif
         }
-        .sheet(item: $identifying) { painting in
-            IdentityView(paintingID: painting.id) { identifying = nil }
+        .inspector(isPresented: $showDetails) {
+            DetailsPanel(paintingID: current)
                 .environmentObject(library)
-                #if os(macOS)
-                .frame(minWidth: 620, minHeight: 560)
-                #endif
+                .inspectorColumnWidth(min: 300, ideal: 360, max: 520)
         }
         #if os(iOS)
         .statusBarHidden()
@@ -526,7 +524,20 @@ struct ExhibitView: View {
                         library.setKeepFrame(!keeps, for: painting.id)
                     }
                 }
-                barButton(painting.identification == nil ? "Identify" : "Details", "magnifyingglass") { identifying = painting }
+                Toggle(isOn: $showDetails) {
+                    Label("Details", systemImage: "sidebar.right")
+                        #if os(iOS)
+                        .font(.subheadline)
+                        #endif
+                }
+                .toggleStyle(.button)
+                .buttonStyle(.bordered)
+                .focusable(false)
+                .keyboardShortcut("i", modifiers: .command)
+                .help("Show or hide the details beside the painting (⌘I)")
+                #if os(iOS)
+                .tint(.white)
+                #endif
                 barButton("Look Up", "info.circle") { lookingUp = painting }
                     .help("Apple's Visual Look Up")
             }

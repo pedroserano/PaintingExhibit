@@ -52,12 +52,12 @@ struct IdentifySettings: View {
     }
 }
 
-/// What's known about which painting this is: the match, the other candidates, the pages Google found,
-/// and a place to confirm, choose another or type the details.
-struct IdentityView: View {
+/// The side panel beside the painting: what's known about which painting this is (the match, the other
+/// candidates, the pages found), and a place to confirm, choose another or type the details. It follows the
+/// painting shown as you move through the exhibit.
+struct DetailsPanel: View {
     @EnvironmentObject var library: Library
     let paintingID: String
-    let close: () -> Void
 
     @State private var title = ""
     @State private var artist = ""
@@ -70,35 +70,32 @@ struct IdentityView: View {
     private var searching: Bool { library.searching.contains(paintingID) }
 
     var body: some View {
-        NavigationStack {
-            Form {
-                statusSection
-                if let identity, !identity.candidates.isEmpty { candidatesSection(identity) }
-                detailsSection
-                if let identity, !identity.pages.isEmpty || !identity.clues.isEmpty { webSection(identity) }
-            }
-            .formStyle(.grouped)
-            .navigationTitle("Which painting is this?")
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) { Button("Done", action: close) }
-                ToolbarItem(placement: .primaryAction) {
-                    Button {
-                        Task {
-                            error = nil
-                            do { try await library.identify(paintingID) } catch { self.error = error.localizedDescription }
-                            loadFields()
-                        }
-                    } label: {
-                        Label(identity?.searchedAt == nil ? "Search" : "Search Again", systemImage: "magnifyingglass")
-                    }
-                    .disabled(searching)
-                }
-            }
-            .onAppear(perform: loadFields)
+        Form {
+            statusSection
+            if let identity, !identity.candidates.isEmpty { candidatesSection(identity) }
+            detailsSection
+            if let identity, !identity.pages.isEmpty || !identity.clues.isEmpty { webSection(identity) }
         }
+        .formStyle(.grouped)
+        .onAppear(perform: loadFields)
+        .onChange(of: paintingID) {
+            error = nil
+            loadFields()
+        }
+        .onChange(of: identity) { loadFields() }
+    }
+
+    private var searchButton: some View {
+        Button {
+            Task {
+                error = nil
+                do { try await library.identify(paintingID) } catch { self.error = error.localizedDescription }
+                loadFields()
+            }
+        } label: {
+            Label(identity?.searchedAt == nil ? "Search" : "Search Again", systemImage: "magnifyingglass")
+        }
+        .disabled(searching)
     }
 
     private func loadFields() {
@@ -112,6 +109,11 @@ struct IdentityView: View {
 
     private var statusSection: some View {
         Section {
+            HStack {
+                Text("Which painting is this?").font(.headline)
+                Spacer()
+                searchButton
+            }
             if searching {
                 HStack { ProgressView(); Text("Searching…") }
             } else if let identity {
