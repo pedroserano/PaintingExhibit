@@ -49,6 +49,10 @@ Your paintings and frame choices are kept.
 - Gently sets exposure from the painting's own brightness range.
 - Each caption shows what was done (for tuning). Identification comes in phase 2.
 - Picks up photos added to (or edited in) the album on its own, while open or on returning to the app.
+- **Adjust Crop** on any painting shows the photo with the crop's four corners; drag them onto the painting's
+  corners (a magnifier shows the spot under your finger) and Save. Your corners are kept when paintings are
+  processed again; **Use Automatic Crop** goes back. Each fix is recorded next to what the app had chosen
+  (Settings › Export Fixes), as the answer key for measuring and improving the automatic cropping.
 - Pinch or double-tap to zoom; swipe to the next painting when not zoomed or at the edge.
 - Settings: ⋯ menu › Settings on iPhone and iPad, ⌘, on the Mac.
 

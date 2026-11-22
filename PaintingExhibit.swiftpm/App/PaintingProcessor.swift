@@ -24,6 +24,13 @@ struct NormPoint: Codable, Hashable {
     var y: Double
 }
 
+/// Corners someone set by hand (top-left, top-right, bottom-right, bottom-left, in the photo with lens
+/// distortion `lensK` undone), used in place of the automatic crop.
+struct ManualCrop: Codable, Hashable {
+    var quad: [NormPoint]
+    var lensK: Double?
+}
+
 /// The non-destructive edit recipe for one painting. The photo in Photos is never changed;
 /// the exhibit image is drawn from the original with these values, and can be redrawn at any time.
 struct ProcessingSettings: Codable, Hashable {
@@ -92,14 +99,42 @@ enum PaintingProcessor {
 
     /// Works out the recipe for a photo, draws the painting with it and writes the image to `url`.
     /// Returns the recipe, with the exposure it settled on filled in.
-    static func analyzeAndRender(imageData: Data, keepFrame: Bool, writeTo url: URL) throws -> ProcessingSettings {
+    /// With `manual`, the corners someone set by hand are used instead of finding the painting.
+    static func analyzeAndRender(imageData: Data, keepFrame: Bool, manual: ManualCrop? = nil,
+                                 writeTo url: URL) throws -> ProcessingSettings {
         var (base, baseCG) = try prepare(imageData)
         // Straighten bent lines first: the frame is found and cropped far more reliably once its edges are straight.
-        let lensK = estimateLens(in: baseCG)
+        let lensK = manual.map { $0.lensK } ?? estimateLens(in: baseCG)
         if let lensK, let undone = undistort(base, k: lensK) { (base, baseCG) = undone }
-        var settings = analyze(base: base, baseCG: baseCG, keepFrame: keepFrame, focal35: lensK == nil ? focalLength35(of: imageData) : nil)
+        var settings = analyze(base: base, baseCG: baseCG, keepFrame: keepFrame,
+                               focal35: lensK == nil ? focalLength35(of: imageData) : nil, forcedQuad: manual?.quad)
         settings.lensK = lensK
         return try render(base: base, settings: settings, writeTo: url)
+    }
+
+    /// The photo as the recipe's corners refer to it (orientation applied, lens distortion `lensK` undone),
+    /// shrunk to `maxDimension`, for setting the corners by hand.
+    static func preparedPhoto(imageData: Data, lensK: Double?, maxDimension: CGFloat = 1600) throws -> CGImage {
+        var (base, baseCG) = try prepare(imageData)
+        if let lensK, let undone = undistort(base, k: lensK) { (base, baseCG) = undone }
+        let scale = min(1, maxDimension / max(base.extent.width, base.extent.height))
+        guard scale < 1 else { return baseCG }
+        let small = base.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        guard let cg = context.createCGImage(small, from: small.extent.integral, format: .RGBA8, colorSpace: sRGB) else {
+            throw ProcessingError.renderFailed
+        }
+        return cg
+    }
+
+    /// The final crop as a quad in the (lens-corrected) photo: the painting's outline, or the canvas inside it
+    /// when the frame is removed; the whole photo when nothing was found.
+    static func cropQuad(of settings: ProcessingSettings) -> [NormPoint] {
+        guard let quad = settings.paintingQuad else {
+            return [NormPoint(x: 0, y: 1), NormPoint(x: 1, y: 1), NormPoint(x: 1, y: 0), NormPoint(x: 0, y: 0)]
+        }
+        guard let canvas = settings.canvasQuad, !settings.keptFrame else { return quad }
+        let toPhoto = squareToQuad(quad)
+        return canvas.map(toPhoto)
     }
 
     /// Draws the painting from the original photo with an existing recipe (no detection).
@@ -337,15 +372,17 @@ enum PaintingProcessor {
         return focal
     }
 
-    private static func analyze(base: CIImage, baseCG: CGImage, keepFrame: Bool, focal35: Double?) -> ProcessingSettings {
+    private static func analyze(base: CIImage, baseCG: CGImage, keepFrame: Bool, focal35: Double?,
+                                forcedQuad: [NormPoint]? = nil) -> ProcessingSettings {
         var settings = ProcessingSettings(
             paintingQuad: nil, canvasQuad: nil, keptFrame: keepFrame,
             lightStrength: 0, whiteBalance: SIMD3(1, 1, 1),
             gainLeft: 1, gainRight: 1, gainTop: 1, gainBottom: 1
         )
 
-        // 1. Find the painting: a clear rectangle with wall around it first, then the main flat object, then
-        // (a close-up) the whole photo, if a frame can be found running along its edges. Thin strips are skipped: they are usually a band across the painting, not the painting.
+        // 1. Find the painting: the photo's subject, if it is rectangular (a painting in its frame); then a clear
+        // rectangle with wall around it, then the main flat object, then (a close-up) the whole photo, if a frame
+        // can be found running along its edges. Thin strips are skipped: they are usually a band across the painting, not the painting.
         let size = base.extent.size
         let plausible: (CGFloat, CGPoint) -> Bool = { area, _ in area >= 0.08 }
         let pixels = smallPixels(base)
@@ -378,7 +415,9 @@ enum PaintingProcessor {
         let rectangle = rectangles(in: baseCG, minimumSize: 0.2, accept: plausible)
             .first { quad in pixels.map { !isWallFeature(quad, in: $0) } ?? true }
             .flatMap(shaped)
-        guard var quad = rectangle
+        guard var quad = forcedQuad
+                ?? foregroundQuad(in: baseCG).flatMap(shaped)
+                ?? rectangle
                 ?? shaped(documentQuad(in: baseCG))
                 // Otherwise assume the painting fills the photo, with its frame near the edges or out of shot.
                 ?? (findCanvas(in: base) != nil ? wholePhoto : nil)
@@ -387,7 +426,7 @@ enum PaintingProcessor {
         }
         // Square it up from the frame's own edges: an outline that missed the perspective (or the whole photo of
         // a painting shot from below or one side) leaves the frame a trapezoid.
-        for _ in 0..<2 {
+        for _ in 0..<(forcedQuad == nil ? 2 : 0) {
             guard let squarer = straighten(quad, in: base) else { break }
             quad = squarer
         }
@@ -400,7 +439,8 @@ enum PaintingProcessor {
         settings.wallBottom = wall.bottom
 
         // 2. Look for the canvas inside the frame (always, so the frame choice can change later).
-        settings.canvasQuad = findCanvas(in: flattenPainting(base, settings: settings))
+        // Corners set by hand are the crop itself.
+        settings.canvasQuad = forcedQuad == nil ? findCanvas(in: flattenPainting(base, settings: settings)) : nil
 
         // 3. Work out the corrections from the wall.
         if let average = wall.average {
@@ -485,6 +525,61 @@ enum PaintingProcessor {
         return quads
             .filter { accept(area(of: $0), center(of: $0)) }
             .sorted { area(of: $0) > area(of: $1) }
+    }
+
+    /// The photo's subject as Vision separates it from the background (the object at the centre of the photo,
+    /// else the largest), as a quad through its outermost corners. Only a rectangular subject counts — a painting
+    /// in its frame fills its outline almost completely; a figure picked out of a painting doesn't.
+    private static func foregroundQuad(in image: CGImage) -> [NormPoint]? {
+        let request = VNGenerateForegroundInstanceMaskRequest()
+        guard (try? VNImageRequestHandler(cgImage: image, options: [:]).perform([request])) != nil,
+              let observation = request.results?.first else { return nil }
+        let mask = observation.instanceMask
+        CVPixelBufferLockBaseAddress(mask, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(mask, .readOnly) }
+        let w = CVPixelBufferGetWidth(mask), h = CVPixelBufferGetHeight(mask), row = CVPixelBufferGetBytesPerRow(mask)
+        guard let base = CVPixelBufferGetBaseAddress(mask)?.assumingMemoryBound(to: UInt8.self) else { return nil }
+        var counts = [UInt8: Int]()
+        for y in 0..<h { for x in 0..<w where base[y * row + x] > 0 { counts[base[y * row + x], default: 0] += 1 } }
+        var label = base[(h / 2) * row + w / 2]
+        if label == 0 { label = counts.max { $0.value < $1.value }?.key ?? 0 }
+        guard label > 0, let pixels = counts[label] else { return nil }
+
+        // Outermost corners (row 0 at the top): top-left has the smallest x + y, and so on.
+        var tl = (Double.infinity, SIMD2<Double>(0, 0)), br = (-Double.infinity, SIMD2<Double>(0, 0))
+        var tr = (-Double.infinity, SIMD2<Double>(0, 0)), bl = (Double.infinity, SIMD2<Double>(0, 0))
+        for y in 0..<h {
+            for x in 0..<w where base[y * row + x] == label {
+                let p = SIMD2((Double(x) + 0.5) / Double(w), (Double(y) + 0.5) / Double(h))
+                if p.x + p.y < tl.0 { tl = (p.x + p.y, p) }
+                if p.x + p.y > br.0 { br = (p.x + p.y, p) }
+                if p.x - p.y > tr.0 { tr = (p.x - p.y, p) }
+                if p.x - p.y < bl.0 { bl = (p.x - p.y, p) }
+            }
+        }
+        let corners = [tl.1, tr.1, br.1, bl.1]
+        let quad = corners.map { NormPoint(x: $0.x, y: 1 - $0.y) }
+        let outline = Double(area(of: quad))
+        guard outline >= 0.15, isConvex(quad) else { return nil }
+        // A rectangle fills its outline and doesn't spill outside it; a face or a tree, whose outermost points
+        // make a diamond, spills well outside.
+        func inside(_ p: SIMD2<Double>) -> Bool {
+            (0..<4).allSatisfy { i in
+                let a = corners[i], b = corners[(i + 1) % 4]
+                return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x) >= -0.002
+            }
+        }
+        var outside = 0
+        for y in stride(from: 0, to: h, by: 2) {
+            for x in stride(from: 0, to: w, by: 2) where base[y * row + x] == label {
+                if !inside(SIMD2((Double(x) + 0.5) / Double(w), (Double(y) + 0.5) / Double(h))) { outside += 4 }
+            }
+        }
+        let share = Double(pixels) / Double(w * h)
+        guard Double(outside) / Double(pixels) < 0.04, (share - Double(outside) / Double(w * h)) >= outline * 0.92 else {
+            return nil
+        }
+        return quad
     }
 
     /// Vision's document finder, as a fallback when no rectangle stands out: it picks out the main

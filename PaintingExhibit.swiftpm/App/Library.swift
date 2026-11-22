@@ -17,6 +17,24 @@ struct Painting: Codable, Identifiable, Hashable {
     var photosRecipe: ProcessingSettings?
     /// The photo was edited elsewhere after this app saved an edit to it, so the app leaves it alone.
     var photosLeftAlone: Bool?
+    /// Corners set by hand, used instead of the automatic crop (kept when paintings are processed again).
+    var manualCrop: ManualCrop?
+}
+
+/// One crop fixed by hand: what the app chose and what the person chose instead. Kept as a record to
+/// measure and improve the automatic cropping against.
+struct CropFix: Codable {
+    var date: Date
+    var photo: String
+    var processingVersion: Int
+    /// The crop being replaced, in the photo with lens distortion `lensK` undone; nil when nothing was cropped.
+    var automatic: [NormPoint]?
+    /// Whether the crop being replaced had itself been set by hand.
+    var replacedManual: Bool
+    /// The corners set by hand; nil when the person went back to the automatic crop.
+    var manual: [NormPoint]?
+    var lensK: Double?
+    var frameRemoved: Bool
 }
 
 /// Keeps the edit recipes, watches the paintings album, and draws paintings from Photos.
@@ -27,7 +45,7 @@ struct Painting: Codable, Identifiable, Hashable {
 @MainActor
 final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     /// Bump this when the analysis changes, so older recipes are worked out again.
-    static let processingVersion = 7
+    static let processingVersion = 8
     /// Identifies this app's edits in Photos, so it can recognise and redo them.
     nonisolated static let adjustmentFormat = "com.pedroserano.PaintingExhibit.recipe"
     /// Long side of the photo when drawing an edit for Photos (the exhibit cache uses less).
@@ -67,6 +85,9 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     private let indexURL: URL
     private var albumFetch: PHFetchResult<PHAsset>?
     private var stale: Set<String> = []          // photos edited elsewhere since they were analysed
+    /// Every crop fixed by hand, one JSON record per line.
+    let fixesURL: URL
+    @Published private(set) var fixCount = 0
     private var ownWrites: [String: Date] = [:]  // photos this app just changed, so their change notice is ignored
     private var forceAll = false
     private var anotherPass = false
@@ -83,12 +104,14 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         try? fm.createDirectory(at: support, withIntermediateDirectories: true)
         try? fm.createDirectory(at: caches, withIntermediateDirectories: true)
         indexURL = support.appendingPathComponent("index.json")
+        fixesURL = support.appendingPathComponent("crop-fixes.jsonl")
         cacheFolder = caches
         let defaults = UserDefaults.standard
         _albumID = Published(initialValue: defaults.string(forKey: "albumID"))
         _keepFramesByDefault = Published(initialValue: defaults.bool(forKey: "keepFramesByDefault"))
         _saveEditsToPhotos = Published(initialValue: defaults.bool(forKey: "saveEditsToPhotos"))
         super.init()
+        fixCount = (try? String(contentsOf: fixesURL, encoding: .utf8))?.split(separator: "\n").count ?? 0
 
         #if os(iOS)
         // Version 0.1 kept full copies in the app's own Documents folder and cache; the new cache replaces them.
@@ -172,6 +195,52 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         Task { await processNew() }
     }
 
+    // MARK: Fixing a crop by hand
+
+    /// The photo as the crop's corners refer to it, for setting them by hand.
+    func editorPhoto(for painting: Painting) async -> CGImage? {
+        guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [painting.id], options: nil).firstObject,
+              let data = try? await Self.source(for: asset).data else { return nil }
+        let lensK = painting.manualCrop?.lensK ?? painting.settings.lensK
+        return try? await Task.detached(priority: .userInitiated) {
+            try PaintingProcessor.preparedPhoto(imageData: data, lensK: lensK)
+        }.value
+    }
+
+    /// The crop now shown, as corners in that photo.
+    func currentCrop(of painting: Painting) -> [NormPoint] {
+        painting.manualCrop?.quad ?? PaintingProcessor.cropQuad(of: painting.settings)
+    }
+
+    /// Uses corners set by hand for one painting (or, with nil, goes back to the automatic crop), redraws it,
+    /// and records the fix.
+    func setManualCrop(_ quad: [NormPoint]?, for id: String) {
+        guard let i = paintings.firstIndex(where: { $0.id == id }) else { return }
+        let painting = paintings[i]
+        let lensK = painting.manualCrop?.lensK ?? painting.settings.lensK
+        let replaced = painting.manualCrop?.quad ?? (painting.settings.paintingQuad == nil ? nil : currentCrop(of: painting))
+        let fix = CropFix(date: Date(), photo: id, processingVersion: Self.processingVersion,
+                          automatic: replaced, replacedManual: painting.manualCrop != nil, manual: quad,
+                          lensK: lensK, frameRemoved: painting.settings.frameRemoved)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        if let line = try? encoder.encode(fix), var text = String(data: line, encoding: .utf8) {
+            text += "\n"
+            if let handle = try? FileHandle(forWritingTo: fixesURL) {
+                handle.seekToEndOfFile()
+                handle.write(Data(text.utf8))
+                try? handle.close()
+            } else {
+                try? Data(text.utf8).write(to: fixesURL)
+            }
+            fixCount += 1
+        }
+        paintings[i].manualCrop = quad.map { ManualCrop(quad: $0, lensK: lensK) }
+        stale.insert(id)
+        save()
+        Task { await processNew() }
+    }
+
     // MARK: Processing
 
     private enum Job { case analyze, redraw }
@@ -221,7 +290,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                 todo.append((asset, .analyze))
                 return
             }
-            if p.settings.keptFrame != self.keepsFrame(p) {
+            if p.manualCrop == nil, p.settings.keptFrame != self.keepsFrame(p) {
                 todo.append((asset, .redraw))
             }
         }
@@ -244,6 +313,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                 let previous = paintings.first { $0.id == id }
                 let keep = previous?.keepFrame ?? keepFramesByDefault
                 let fileName = previous?.fileName ?? Self.fileName(for: id)
+                let manual = previous?.manualCrop
                 let url = cacheFolder.appendingPathComponent(fileName)
 
                 let settings: ProcessingSettings
@@ -257,7 +327,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                     }.value
                 } else {
                     settings = try await Task.detached(priority: .userInitiated) {
-                        try PaintingProcessor.analyzeAndRender(imageData: data, keepFrame: keep, writeTo: url)
+                        try PaintingProcessor.analyzeAndRender(imageData: data, keepFrame: keep, manual: manual, writeTo: url)
                     }.value
                 }
 
@@ -272,7 +342,8 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                     renderedAt: Date(),
                     version: Self.processingVersion,
                     photosRecipe: previous?.photosRecipe,
-                    photosLeftAlone: previous?.photosLeftAlone
+                    photosLeftAlone: previous?.photosLeftAlone,
+                    manualCrop: manual
                 )
                 if let i = paintings.firstIndex(where: { $0.id == id }) {
                     paintings[i] = painting

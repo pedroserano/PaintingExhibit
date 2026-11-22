@@ -96,6 +96,19 @@ struct SettingsView: View {
             }
 
             Section {
+                LabeledContent("Crops fixed by hand", value: "\(library.fixCount)")
+                if library.fixCount > 0 {
+                    ShareLink(item: library.fixesURL) {
+                        Label("Export Fixes", systemImage: "square.and.arrow.up")
+                    }
+                }
+            } footer: {
+                Text("""
+                Each crop you adjust is recorded with what the app had chosen, so the automatic cropping can be                 measured against your fixes and improved. Export the record to share it.
+                """)
+            }
+
+            Section {
                 Toggle("Save edits to Photos", isOn: $library.saveEditsToPhotos)
                 if library.editedInPhotosCount > 0 {
                     Button("Remove Edits from Photos (\(library.editedInPhotosCount))", role: .destructive) {
@@ -231,6 +244,7 @@ struct ExhibitView: View {
     @EnvironmentObject var library: Library
     @State private var current: String
     @State private var showLabel = true
+    @State private var adjusting: Painting?
     let close: () -> Void
 
     init(startID: String, close: @escaping () -> Void) {
@@ -256,7 +270,14 @@ struct ExhibitView: View {
         }
         #if os(iOS)
         .statusBarHidden()
+        .fullScreenCover(item: $adjusting) { painting in
+            CropEditor(painting: painting) { adjusting = nil }
+        }
         #else
+        .sheet(item: $adjusting) { painting in
+            CropEditor(painting: painting) { adjusting = nil }
+                .frame(minWidth: 760, minHeight: 620)
+        }
         .focusable()
         .focusEffectDisabled()
         .onKeyPress(.leftArrow) { step(-1); return .handled }
@@ -314,7 +335,17 @@ struct ExhibitView: View {
 
     private var controls: some View {
         HStack {
-            if let painting = currentPainting, painting.settings.frameFound {
+            if let painting = currentPainting {
+                Button {
+                    adjusting = painting
+                } label: {
+                    Label("Adjust Crop", systemImage: "crop.rotate")
+                        .font(.subheadline)
+                }
+                .buttonStyle(.bordered)
+                .tint(.white)
+            }
+            if let painting = currentPainting, painting.settings.frameFound, painting.manualCrop == nil {
                 let keeps = library.keepsFrame(painting)
                 Button {
                     library.setKeepFrame(!keeps, for: painting.id)
@@ -399,8 +430,12 @@ struct WallLabel: View {
     private var processingSummary: String {
         let s = painting.settings
         var parts: [String] = []
-        parts.append(s.cropFound ? "cropped" : "no edges found")
-        if s.frameFound {
+        if painting.manualCrop != nil {
+            parts.append("cropped by hand")
+        } else {
+            parts.append(s.cropFound ? "cropped" : "no edges found")
+        }
+        if s.frameFound && painting.manualCrop == nil {
             parts.append(s.keptFrame ? "frame kept" : "frame removed")
         } else if s.cropFound {
             parts.append("no frame found")
@@ -410,7 +445,7 @@ struct WallLabel: View {
         }
         if s.unevenLightFixed { parts.append("spotlight evened") }
         if painting.photosRecipe != nil { parts.append("saved to Photos") }
-        if keepsFrame != s.keptFrame { parts.append("updating…") }
+        if keepsFrame != s.keptFrame && painting.manualCrop == nil { parts.append("updating…") }
         return parts.joined(separator: " · ")
     }
 }
