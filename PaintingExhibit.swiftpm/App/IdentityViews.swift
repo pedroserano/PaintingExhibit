@@ -74,6 +74,7 @@ struct DetailsPanel: View {
             statusSection
             if let identity, !identity.candidates.isEmpty { candidatesSection(identity) }
             detailsSection
+            if let painting { LookUpSection(painting: painting).id(painting.id) }
             if let identity, !identity.pages.isEmpty || !identity.clues.isEmpty { webSection(identity) }
         }
         .formStyle(.grouped)

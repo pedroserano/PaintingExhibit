@@ -338,11 +338,15 @@ struct ExhibitView: View {
     @EnvironmentObject var library: Library
     @State private var current: String
     @State private var showLabel = true
-    @State private var adjusting: Painting?
+    /// Editing modes that stay on while moving from painting to painting, so each painting can be checked in
+    /// turn: Adjust Crop (the whole photo with the crop's corners) and White Balance.
+    enum Mode { case view, crop, colour }
+    @State private var mode: Mode = .view
+    private func binding(_ m: Mode) -> Binding<Bool> {
+        Binding(get: { mode == m }, set: { mode = $0 ? m : .view })
+    }
     /// Whether the details panel is open beside the painting (remembered).
     @AppStorage("showDetails") private var showDetails = false
-    @State private var lookingUp: Painting?
-    @State private var colouring: Painting?
     @FocusState private var focused: Bool
     /// The paintings to move through: those in `only`, in album order, or all of them.
     private let only: [String]?
@@ -382,28 +386,15 @@ struct ExhibitView: View {
         .onKeyPress(.rightArrow) { step(1); return .handled }
         .onKeyPress(.upArrow) { step(-1); return .handled }
         .onKeyPress(.downArrow) { step(1); return .handled }
-        .onKeyPress(.escape) { close(); return .handled }
+        .onKeyPress(.escape) {
+            if mode != .view { mode = .view } else { close() }
+            return .handled
+        }
         .onKeyPress(.space) { toggleLabel(); return .handled }
         .onAppear { focused = true }
         .onChange(of: current) { focused = true }
         .onChange(of: showLabel) { focused = true }
-        .onChange(of: adjusting) { _, editing in if editing == nil { focused = true } }
-        .onChange(of: lookingUp) { _, open in if open == nil { focused = true } }
-        .onChange(of: colouring) { _, open in if open == nil { focused = true } }
-        .sheet(item: $colouring) { painting in
-            ColourView(painting: painting) { colouring = nil }
-                .environmentObject(library)
-                #if os(macOS)
-                .frame(minWidth: 720, minHeight: 640)
-                #endif
-        }
-        .sheet(item: $lookingUp) { painting in
-            LookUpView(painting: painting) { lookingUp = nil }
-                .environmentObject(library)
-                #if os(macOS)
-                .frame(minWidth: 700, minHeight: 600)
-                #endif
-        }
+        .onChange(of: mode) { focused = true }
         .inspector(isPresented: $showDetails) {
             DetailsPanel(paintingID: current)
                 .environmentObject(library)
@@ -411,15 +402,42 @@ struct ExhibitView: View {
         }
         #if os(iOS)
         .statusBarHidden()
-        .fullScreenCover(item: $adjusting) { painting in
-            CropEditor(painting: painting) { adjusting = nil }
-        }
-        #else
-        .sheet(item: $adjusting) { painting in
-            CropEditor(painting: painting) { adjusting = nil }
-                .frame(minWidth: 760, minHeight: 620)
-        }
         #endif
+    }
+
+    /// The painting, or in Adjust Crop mode the photo with the crop's corners.
+    @ViewBuilder private var mainArea: some View {
+        if mode == .view {
+            pages
+        } else {
+            ZStack {
+                Color.black
+                if let painting = currentPainting {
+                    if mode == .crop {
+                        CropEditor(painting: painting).id(painting.id)
+                    } else {
+                        ColourEditor(painting: painting).id(painting.id)
+                    }
+                }
+                stepButtons
+            }
+        }
+    }
+
+    /// Previous and next, at the sides.
+    private var stepButtons: some View {
+        HStack {
+            Button { step(-1) } label: { Image(systemName: "chevron.left") }
+                .disabled(index == nil || index == 0)
+            Spacer()
+            Button { step(1) } label: { Image(systemName: "chevron.right") }
+                .disabled(index == nil || index == list.count - 1)
+        }
+        .buttonStyle(.plain)
+        .focusable(false)
+        .font(.system(size: 34, weight: .light))
+        .foregroundStyle(.white.opacity(0.8))
+        .padding(.horizontal, 20)
     }
 
     #if os(macOS)
@@ -432,7 +450,7 @@ struct ExhibitView: View {
                     .background(.bar)
                 Divider()
             }
-            pages
+            mainArea
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color.black)
             if showLabel, let painting = currentPainting {
@@ -445,8 +463,8 @@ struct ExhibitView: View {
     private var layout: some View {
         ZStack(alignment: .top) {
             Color.black.ignoresSafeArea()
-            pages
-            if showLabel {
+            mainArea
+            if showLabel || mode != .view {
                 controls.transition(.opacity)
             }
         }
@@ -486,20 +504,7 @@ struct ExhibitView: View {
                 PaintingPage(painting: painting, showLabel: showLabel, toggleLabel: toggleLabel)
                     .id(painting.id)
             }
-            if showLabel {
-                HStack {
-                    Button { step(-1) } label: { Image(systemName: "chevron.left") }
-                        .disabled(index == 0)
-                    Spacer()
-                    Button { step(1) } label: { Image(systemName: "chevron.right") }
-                        .disabled(index == nil || index == list.count - 1)
-                }
-                .buttonStyle(.plain)
-                .focusable(false)
-                .font(.system(size: 34, weight: .light))
-                .foregroundStyle(.white.opacity(0.8))
-                .padding(.horizontal, 20)
-            }
+            if showLabel { stepButtons }
         }
     }
 
@@ -516,8 +521,32 @@ struct ExhibitView: View {
             Divider().frame(height: 18)
             #endif
             if let painting = currentPainting {
-                barButton("Adjust Crop", "crop.rotate") { adjusting = painting }
-                barButton("White Balance", "eyedropper.halffull") { colouring = painting }
+                Toggle(isOn: binding(.crop)) {
+                    Label("Adjust Crop", systemImage: "crop.rotate")
+                        #if os(iOS)
+                        .font(.subheadline)
+                        #endif
+                }
+                .toggleStyle(.button)
+                .buttonStyle(.bordered)
+                .focusable(false)
+                .help("Show the whole photo with the crop's corners; stays on as you move between paintings (Esc to leave)")
+                #if os(iOS)
+                .tint(.white)
+                #endif
+                Toggle(isOn: binding(.colour)) {
+                    Label("White Balance", systemImage: "eyedropper.halffull")
+                        #if os(iOS)
+                        .font(.subheadline)
+                        #endif
+                }
+                .toggleStyle(.button)
+                .buttonStyle(.bordered)
+                .focusable(false)
+                .help("Warmth, tint and a white-point eyedropper; stays on as you move between paintings (Esc to leave)")
+                #if os(iOS)
+                .tint(.white)
+                #endif
                 if painting.settings.frameFound, painting.manualCrop == nil {
                     let keeps = library.keepsFrame(painting)
                     barButton(keeps ? "Remove Frame" : "Show Frame", keeps ? "crop" : "square.dashed") {
@@ -538,8 +567,6 @@ struct ExhibitView: View {
                 #if os(iOS)
                 .tint(.white)
                 #endif
-                barButton("Look Up", "info.circle") { lookingUp = painting }
-                    .help("Apple's Visual Look Up")
             }
             Spacer()
             #if os(iOS)

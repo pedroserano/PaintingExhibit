@@ -1,115 +1,129 @@
 import SwiftUI
 import CoreImage
 
-/// Setting a painting's white balance by hand: warmth and tint sliders, and an eyedropper that makes the spot
-/// you tap neutral (pick something that should be white or grey). The preview updates as you go; Save redraws
-/// the painting from the original photo.
-struct ColourView: View {
+/// Setting a painting's white balance by hand, in the exhibit's White Balance mode: the painting with a live
+/// preview, warmth and tint sliders, and an eyedropper that makes the spot you tap neutral (pick something that
+/// should be white or grey). Changes are saved with Save (Return), or when you move on to another painting or
+/// leave the mode; Revert puts them back first.
+struct ColourEditor: View {
     @EnvironmentObject var library: Library
     let painting: Painting
-    let close: () -> Void
 
     @State private var adjust: ColourAdjust
+    /// The balance as last saved, to tell whether anything changed.
+    @State private var saved: ColourAdjust
     @State private var base: CGImage?
     @State private var pixels: [UInt8] = []
     @State private var preview: CGImage?
     @State private var picking = false
     @State private var picked: CGPoint?
-    @State private var saving = false
 
     private static let context = CIContext()
 
-    init(painting: Painting, close: @escaping () -> Void) {
+    init(painting: Painting) {
         self.painting = painting
-        self.close = close
         _adjust = State(initialValue: painting.settings.colour ?? .neutral)
+        _saved = State(initialValue: painting.settings.colour ?? .neutral)
     }
 
+    private var changed: Bool { adjust != saved }
+
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 14) {
-                GeometryReader { geo in
-                    ZStack {
-                        if let preview {
-                            Image(decorative: preview, scale: 1)
-                                .resizable()
-                                .scaledToFit()
-                                .frame(width: geo.size.width, height: geo.size.height)
-                        } else {
-                            ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
-                        }
-                        if let picked {
-                            Circle().strokeBorder(.white, lineWidth: 2)
-                                .background(Circle().strokeBorder(.black, lineWidth: 4))
-                                .frame(width: 22, height: 22)
-                                .position(picked)
-                                .allowsHitTesting(false)
-                        }
+        VStack(spacing: 0) {
+            GeometryReader { geo in
+                ZStack {
+                    if let preview {
+                        Image(decorative: preview, scale: 1)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: geo.size.width, height: geo.size.height)
+                    } else {
+                        ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
-                    .contentShape(Rectangle())
-                    .onTapGesture(coordinateSpace: .local) { location in
-                        guard picking else { return }
-                        pick(at: location, in: geo.size)
+                    if let picked {
+                        Circle().strokeBorder(.white, lineWidth: 2)
+                            .background(Circle().strokeBorder(.black, lineWidth: 4))
+                            .frame(width: 22, height: 22)
+                            .position(picked)
+                            .allowsHitTesting(false)
                     }
                 }
-                .background(Color.black)
-
-                Text(picking ? "Tap a spot that should be white or neutral grey."
-                             : "Drag the sliders, or use the eyedropper to pick a white point.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-
-                VStack(spacing: 8) {
-                    slider("Warmth", value: $adjust.warmth, low: "Cooler", high: "Warmer")
-                    slider("Tint", value: $adjust.tint, low: "Green", high: "Magenta")
+                .contentShape(Rectangle())
+                .onTapGesture(coordinateSpace: .local) { location in
+                    guard picking else { return }
+                    pick(at: location, in: geo.size)
                 }
-                .padding(.horizontal)
+                #if os(macOS)
+                .onContinuousHover { phase in
+                    if case .active = phase, picking { NSCursor.crosshair.set() } else { NSCursor.arrow.set() }
+                }
+                #endif
+            }
+            .padding(.vertical, 16)
+            .padding(.horizontal, 64)   // clear of the previous and next arrows
 
-                HStack {
-                    Button {
-                        picking.toggle()
-                    } label: {
-                        Label(picking ? "Picking…" : "Pick White Point", systemImage: "eyedropper")
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(picking ? .accentColor : nil)
+            controls
+                .padding(.horizontal, 64)
+                .padding(.bottom, 12)
+        }
+        .task(id: painting.renderedAt) { await load() }
+        .onChange(of: adjust) { updatePreview() }
+        // Moving to another painting or leaving the mode keeps what was done.
+        .onDisappear {
+            if changed { Task { [library, adjust, id = painting.id] in await library.setColour(adjust, for: id) } }
+        }
+    }
+
+    private var controls: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 16) {
+                slider("Warmth", value: $adjust.warmth, low: "Cooler", high: "Warmer")
+                slider("Tint", value: $adjust.tint, low: "Green", high: "Magenta")
+            }
+            HStack(spacing: 12) {
+                Button {
+                    picking.toggle()
+                } label: {
+                    Label(picking ? "Click a White Spot…" : "Pick White Point", systemImage: "eyedropper")
+                }
+                .help("Click a spot in the painting that should be white or neutral grey")
+                Text(picking ? "Click something that should be white or grey."
+                     : changed ? "Saved when you move on, or press Save." : "Drag the sliders, or pick a white point.")
+                    .font(.footnote)
+                    .foregroundStyle(.white.opacity(0.7))
+                Spacer()
+                if adjust != .neutral {
                     Button("Reset") {
                         adjust = .neutral
                         picked = nil
                     }
-                    .buttonStyle(.bordered)
-                    .disabled(adjust == .neutral)
                 }
-            }
-            .padding(.vertical)
-            .navigationTitle("White Balance")
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel", action: close) }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button(saving ? "Saving…" : "Save") {
-                        saving = true
-                        Task {
-                            await library.setColour(adjust, for: painting.id)
-                            close()
-                        }
+                if changed {
+                    Button("Revert") {
+                        adjust = saved
+                        picked = nil
                     }
-                    .disabled(saving || adjust == (painting.settings.colour ?? .neutral))
+                    Button("Save") {
+                        let value = adjust
+                        saved = value
+                        Task { await library.setColour(value, for: painting.id) }
+                    }
+                    .keyboardShortcut(.defaultAction)
                 }
             }
-            .task { await load() }
-            .onChange(of: adjust) { updatePreview() }
         }
+        .buttonStyle(.bordered)
+        .focusable(false)
+        .tint(.white)
+        .foregroundStyle(.white)
     }
 
     private func slider(_ title: String, value: Binding<Float>, low: String, high: String) -> some View {
-        HStack {
-            Text(title).frame(width: 70, alignment: .leading)
-            Text(low).font(.caption).foregroundStyle(.secondary)
+        HStack(spacing: 6) {
+            Text(title).frame(width: 56, alignment: .leading)
+            Text(low).font(.caption).foregroundStyle(.white.opacity(0.6))
             Slider(value: value, in: -1...1)
-            Text(high).font(.caption).foregroundStyle(.secondary)
+            Text(high).font(.caption).foregroundStyle(.white.opacity(0.6))
         }
     }
 
@@ -117,7 +131,7 @@ struct ColourView: View {
 
     private func load() async {
         guard let url = await library.imageURL(for: painting),
-              let image = await ImageLoader.load(url, maxPixel: 1600) else { return }
+              let image = await ImageLoader.load(url, maxPixel: 2000) else { return }
         base = image
         pixels = Self.bytes(of: image)
         updatePreview()
@@ -141,7 +155,7 @@ struct ColourView: View {
 
     // MARK: Eyedropper
 
-    /// Makes the colour around the tapped spot neutral: it is taken back to how the painting looked before any
+    /// Makes the colour around the clicked spot neutral: it is taken back to how the painting looked before any
     /// hand-set balance, and the warmth and tint that turn that grey are set.
     private func pick(at location: CGPoint, in size: CGSize) {
         guard let base, !pixels.isEmpty else { return }

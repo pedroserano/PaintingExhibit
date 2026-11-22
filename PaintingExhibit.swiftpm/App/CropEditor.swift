@@ -1,37 +1,28 @@
 import SwiftUI
 
-/// Setting a painting's corners by hand: the photo with the current crop's four corners, which you drag onto
-/// the painting's corners. A magnifier shows the spot under the corner while dragging.
+/// Setting a painting's corners by hand, in the exhibit's Adjust Crop mode: the photo with the crop's four
+/// corners, which you drag onto the painting's corners. A magnifier shows the spot under the corner while
+/// dragging. Changes are saved with Save (Return), or when you move on to another painting or leave the mode;
+/// Revert puts the corners back first.
 struct CropEditor: View {
     @EnvironmentObject var library: Library
     let painting: Painting
-    let close: () -> Void
 
     @State private var photo: CGImage?
     @State private var failed = false
     /// Top-left, top-right, bottom-right, bottom-left, as fractions of the photo with row 0 at the top.
     @State private var corners: [CGPoint] = []
+    /// The corners as last saved (or as the crop was), to tell whether anything changed.
+    @State private var saved: [CGPoint] = []
     @State private var dragging: Int?
     @State private var dragStart: CGPoint?
 
+    private var changed: Bool {
+        corners.count == 4 && saved.count == 4 && zip(corners, saved).contains { abs($0.x - $1.x) > 1e-4 || abs($0.y - $1.y) > 1e-4 }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Button("Cancel", action: close)
-                    .keyboardShortcut(.cancelAction)
-                Spacer()
-                Text("Adjust Crop").font(.headline)
-                Spacer()
-                Button("Save") {
-                    library.setManualCrop(corners.map { NormPoint(x: $0.x, y: 1 - $0.y) }, for: painting.id)
-                    close()
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(corners.count != 4 || !isConvex)
-                .fontWeight(.semibold)
-            }
-            .padding()
-
             GeometryReader { geo in
                 if let photo {
                     let size = fittedSize(for: photo, in: geo.size)
@@ -45,30 +36,45 @@ struct CropEditor: View {
                     ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
-            .padding(24)
+            .padding(.vertical, 16)
+            .padding(.horizontal, 64)   // clear of the previous and next arrows
 
-            VStack(spacing: 10) {
-                Text("Drag each corner onto a corner of the painting.")
+            HStack(spacing: 12) {
+                Text(changed ? "Saved when you move on, or press Save." : "Drag each corner onto a corner of the painting.")
                     .font(.footnote)
-                    .foregroundStyle(.secondary)
-                if painting.manualCrop != nil {
-                    Button("Use Automatic Crop") {
-                        library.setManualCrop(nil, for: painting.id)
-                        close()
-                    }
+                    .foregroundStyle(.white.opacity(0.7))
+                Spacer()
+                if painting.manualCrop != nil && !changed {
+                    Button("Use Automatic Crop") { library.setManualCrop(nil, for: painting.id) }
+                }
+                if changed {
+                    Button("Revert") { corners = saved }
+                    Button("Save", action: save)
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(!isConvex)
                 }
             }
-            .padding(.bottom)
+            .buttonStyle(.bordered)
+            .focusable(false)
+            .padding(.horizontal, 64)
+            .padding(.bottom, 12)
+            .frame(minHeight: 44)
         }
-        .foregroundStyle(.white)
         .tint(.white)
-        .background(Color.black.ignoresSafeArea())
         .task {
             // An automatic outline can run off the photo; start every corner on it, where it can be dragged.
             corners = library.currentCrop(of: painting).map { CGPoint(x: min(max($0.x, 0), 1), y: min(max(1 - $0.y, 0), 1)) }
+            saved = corners
             photo = await library.editorPhoto(for: painting)
             failed = photo == nil
         }
+        // Moving to another painting or leaving the mode keeps what was done.
+        .onDisappear { if changed && isConvex { save() } }
+    }
+
+    private func save() {
+        library.setManualCrop(corners.map { NormPoint(x: $0.x, y: 1 - $0.y) }, for: painting.id)
+        saved = corners
     }
 
     private func editor(photo: CGImage, size: CGSize) -> some View {

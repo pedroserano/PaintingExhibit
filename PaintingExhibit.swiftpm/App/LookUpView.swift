@@ -1,41 +1,34 @@
 import SwiftUI
 import VisionKit
 
-/// The painting with Apple's Visual Look Up, which recognises many famous paintings on the device. Apple shows
-/// its answer only on screen (the ⓘ badge), so this is for checking by eye; what you learn can be typed into
-/// the painting's details.
-struct LookUpView: View {
+/// Apple's Visual Look Up, in the details panel: the painting with Apple's ⓘ badge, which recognises many famous
+/// paintings on the device. Apple shows its answer only on screen, so this is for checking by eye; what you
+/// learn can be typed into the details below.
+struct LookUpSection: View {
     @EnvironmentObject var library: Library
     let painting: Painting
-    let close: () -> Void
 
     @State private var image: CGImage?
     @State private var found: Bool?
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 12) {
-                if let image {
-                    LookUpImage(image: image) { found = $0 }
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
-                Text(message)
-                    .font(.callout)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal)
+        Section {
+            if let image {
+                LookUpImage(image: image) { found = $0 }
+                    .frame(height: 220)
+                    .frame(maxWidth: .infinity)
+            } else {
+                ProgressView().frame(maxWidth: .infinity, minHeight: 80)
             }
-            .padding(.bottom)
-            .navigationTitle("Apple Visual Look Up")
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done", action: close) } }
-            .task {
-                guard let url = await library.imageURL(for: painting) else { return }
-                image = await ImageLoader.load(url, maxPixel: 2048)
-            }
+            Text(message).font(.footnote).foregroundStyle(.secondary)
+        } header: {
+            Text("Apple Visual Look Up")
+        }
+        .task(id: painting.id) {
+            image = nil
+            found = nil
+            guard let url = await library.imageURL(for: painting) else { return }
+            image = await ImageLoader.load(url, maxPixel: 1200)
         }
     }
 
@@ -43,8 +36,8 @@ struct LookUpView: View {
         guard ImageAnalyzer.isSupported else { return "Visual Look Up isn't available on this device." }
         switch found {
         case nil: return "Looking…"
-        case true?: return "Tap the ⓘ badge on the painting to see what Apple recognises. You can type what it says into the painting's Details."
-        case false?: return "Apple's Visual Look Up didn't recognise this painting."
+        case true?: return "Click the ⓘ badge on the painting to see what Apple recognises."
+        case false?: return "Apple didn't recognise this painting."
         }
     }
 }
