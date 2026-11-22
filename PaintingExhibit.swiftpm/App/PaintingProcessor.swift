@@ -206,11 +206,12 @@ enum PaintingProcessor {
         imageData: Data,
         settings: ProcessingSettings,
         maxDimension: CGFloat = PaintingProcessor.maxDimension,
-        writeTo url: URL
+        writeTo url: URL,
+        as fileType: UTType = .jpeg
     ) throws -> ProcessingSettings {
         var (base, _) = try prepare(imageData, maxDimension: maxDimension)
         if let k = settings.lensK, let undone = undistort(base, k: k) { base = undone.0 }
-        return try render(base: base, settings: settings, writeTo: url)
+        return try render(base: base, settings: settings, writeTo: url, as: fileType)
     }
 
     // MARK: Preparing the photo
@@ -547,7 +548,8 @@ enum PaintingProcessor {
 
     // MARK: Rendering
 
-    private static func render(base: CIImage, settings: ProcessingSettings, writeTo url: URL) throws -> ProcessingSettings {
+    private static func render(base: CIImage, settings: ProcessingSettings, writeTo url: URL,
+                               as fileType: UTType = .jpeg) throws -> ProcessingSettings {
         var settings = settings
         var painting = base
         if settings.paintingQuad != nil {
@@ -564,7 +566,7 @@ enum PaintingProcessor {
 
         // Write to a temporary file first, so a half-written image is never shown.
         let tmp = url.deletingLastPathComponent().appendingPathComponent(UUID().uuidString + ".tmp")
-        guard let destination = CGImageDestinationCreateWithURL(tmp as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else {
+        guard let destination = CGImageDestinationCreateWithURL(tmp as CFURL, fileType.identifier as CFString, 1, nil) else {
             throw ProcessingError.writeFailed
         }
         CGImageDestinationAddImage(destination, output, [kCGImageDestinationLossyCompressionQuality: 0.92] as CFDictionary)

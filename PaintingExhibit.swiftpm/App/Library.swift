@@ -323,8 +323,13 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                 var entry = shared[key] ?? SharedEntry()
                 let p = paintings[i]
 
-                // Edits: the newer side wins.
-                let mine = p.editedAt ?? .distantPast, theirs = entry.editedAt ?? .distantPast
+                // Edits: the newer side wins. Edits made before sharing existed carry no time; they still count
+                // as newer than nothing shared.
+                let hasEdits = p.manualCrop != nil || p.settings.colour != nil || p.keepFrame != nil
+                if p.editedAt == nil, hasEdits {
+                    paintings[i].editedAt = p.renderedAt
+                }
+                let mine = paintings[i].editedAt ?? .distantPast, theirs = entry.editedAt ?? .distantPast
                 if theirs > mine {
                     if entry.manualCrop != p.manualCrop || entry.colour != p.settings.colour {
                         paintings[i].manualCrop = entry.manualCrop
@@ -341,7 +346,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                     entry.manualCrop = p.manualCrop
                     entry.colour = p.settings.colour
                     entry.keepFrame = p.keepFrame
-                    entry.editedAt = p.editedAt
+                    entry.editedAt = paintings[i].editedAt
                     changedShared = true
                 }
 
@@ -874,59 +879,97 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         guard saveEditsToPhotos else { return }
         let todo = paintings.filter { $0.photosLeftAlone != true && $0.photosRecipe != $0.settings }
         guard !todo.isEmpty else { return }
-
-        var edits: [(asset: PHAsset, output: PHContentEditingOutput, recipe: ProcessingSettings)] = []
         progressDone = 0
         progressTotal = todo.count
-        for painting in todo {
-            defer { progressDone += 1 }
-            guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [painting.id], options: nil).firstObject else { continue }
-            do {
-                let source = try await Self.source(for: asset)
-                if let format = source.existingFormat, format != Self.adjustmentFormat, painting.photosRecipe != nil {
-                    // Edited elsewhere after this app saved its edit: leave it alone.
-                    markLeftAlone(painting.id)
-                    continue
-                }
-                let output = PHContentEditingOutput(contentEditingInput: source.input)
-                output.adjustmentData = PHAdjustmentData(
-                    formatIdentifier: Self.adjustmentFormat,
-                    formatVersion: "1",
-                    data: try JSONEncoder().encode(painting.settings)
-                )
-                let target = output.renderedContentURL
-                let recipe = painting.settings
-                let data = source.data
-                _ = try await Task.detached(priority: .utility) {
-                    try PaintingProcessor.render(imageData: data, settings: recipe,
-                                                 maxDimension: Library.photosEditMaxDimension, writeTo: target)
-                }.value
-                edits.append((asset, output, recipe))
-            } catch {
-                lastError = "An edit couldn't be prepared for Photos: \(error.localizedDescription)"
-            }
-        }
-        guard !edits.isEmpty else { return }
+        var failures: [String] = []
 
-        do {
-            try await PHPhotoLibrary.shared().performChanges {
-                for edit in edits {
-                    PHAssetChangeRequest(for: edit.asset).contentEditingOutput = edit.output
+        // In small batches: Photos takes or refuses a whole batch, so one photo it won't take can't hold
+        // the rest back (a refused batch is tried again one photo at a time).
+        for batch in stride(from: 0, to: todo.count, by: 20).map({ Array(todo[$0..<min($0 + 20, todo.count)]) }) {
+            var edits: [(asset: PHAsset, output: PHContentEditingOutput, recipe: ProcessingSettings)] = []
+            for painting in batch {
+                defer { progressDone += 1 }
+                guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [painting.id], options: nil).firstObject else { continue }
+                do {
+                    let source = try await Self.source(for: asset)
+                    if let format = source.existingFormat, format != Self.adjustmentFormat, painting.photosRecipe != nil {
+                        // Edited elsewhere after this app saved its edit: leave it alone.
+                        markLeftAlone(painting.id)
+                        continue
+                    }
+                    let output = PHContentEditingOutput(contentEditingInput: source.input)
+                    output.adjustmentData = PHAdjustmentData(
+                        formatIdentifier: Self.adjustmentFormat,
+                        formatVersion: "1",
+                        data: try JSONEncoder().encode(painting.settings)
+                    )
+                    // The image in the format Photos asks for (HEIC or JPEG, depending on the photo).
+                    let type = output.defaultRenderedContentType ?? .jpeg
+                    let target = try output.renderedContentURL(for: type)
+                    let recipe = painting.settings
+                    let data = source.data
+                    _ = try await Task.detached(priority: .utility) {
+                        try PaintingProcessor.render(imageData: data, settings: recipe,
+                                                     maxDimension: Library.photosEditMaxDimension, writeTo: target, as: type)
+                    }.value
+                    edits.append((asset, output, recipe))
+                } catch {
+                    failures.append(Self.describe(error))
                 }
             }
+            for group in await commit(edits) { failures.append(group) }
+        }
+        if failures.isEmpty {
+            lastError = nil
+        } else {
+            let reasons = Dictionary(grouping: failures, by: { $0 }).sorted { $0.value.count > $1.value.count }
+                .prefix(2).map { "\($0.key) (\($0.value.count))" }.joined(separator: "; ")
+            lastError = "Photos didn't save \(failures.count) of \(todo.count) edits: \(reasons)."
+        }
+    }
+
+    /// Saves edits to Photos as one change; if Photos refuses it, each photo separately. Returns why any failed.
+    private func commit(_ edits: [(asset: PHAsset, output: PHContentEditingOutput, recipe: ProcessingSettings)]) async -> [String] {
+        guard !edits.isEmpty else { return [] }
+        func saved(_ done: [(asset: PHAsset, output: PHContentEditingOutput, recipe: ProcessingSettings)]) {
             let now = Date()
-            for edit in edits {
+            for edit in done {
                 let id = edit.asset.localIdentifier
                 ownWrites[id] = now
-                if let i = paintings.firstIndex(where: { $0.id == id }) {
-                    paintings[i].photosRecipe = edit.recipe
-                }
+                if let i = paintings.firstIndex(where: { $0.id == id }) { paintings[i].photosRecipe = edit.recipe }
             }
             save()
-        } catch {
-            // Most often "Don't Allow" on the permission prompt.
-            lastError = "Photos didn't save the edits: \(error.localizedDescription)"
         }
+        do {
+            try await PHPhotoLibrary.shared().performChanges {
+                for edit in edits { PHAssetChangeRequest(for: edit.asset).contentEditingOutput = edit.output }
+            }
+            saved(edits)
+            return []
+        } catch {
+            guard edits.count > 1 else { return [Self.describe(error)] }
+            var failures: [String] = []
+            for edit in edits {
+                do {
+                    try await PHPhotoLibrary.shared().performChanges {
+                        PHAssetChangeRequest(for: edit.asset).contentEditingOutput = edit.output
+                    }
+                    saved([edit])
+                } catch {
+                    failures.append(Self.describe(error))
+                }
+            }
+            return failures
+        }
+    }
+
+    /// An error with its code, so a problem can be told apart (Photos' messages are often the same for all).
+    private static func describe(_ error: Error) -> String {
+        let e = error as NSError
+        if e.domain == PHPhotosError.errorDomain, e.code == PHPhotosError.Code.userCancelled.rawValue {
+            return "you chose Don't Allow"
+        }
+        return "\(e.localizedDescription) [\(e.domain) \(e.code)]"
     }
 
     /// Reverts every photo this app saved an edit to, and turns saving edits off.
