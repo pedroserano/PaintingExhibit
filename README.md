@@ -49,7 +49,7 @@ Your paintings and frame choices are kept.
     and it made photos of the same painting differ more than the cameras did;
   - the difference between sides evens out spotlight falloff across the canvas.
 - Gently sets exposure from the painting's own brightness range.
-- Each caption shows what was done (for tuning). Identification comes in phase 2.
+- Each caption shows the painting's title, artist, date and museum once identified (see below), and what was done.
 - Picks up photos added to (or edited in) the album on its own, while open or on returning to the app.
 - **Adjust Crop** on any painting shows the photo with the crop's four corners; drag them onto the painting's
   corners (a magnifier shows the spot under your finger) and Save. Your corners are kept when paintings are
@@ -58,6 +58,35 @@ Your paintings and frame choices are kept.
   the automatic cropping.
 - Pinch or double-tap to zoom; swipe to the next painting when not zoomed or at the edge.
 - Settings: ⋯ menu › Settings on iPhone and iPad, ⌘, on the Mac.
+
+## Identifying paintings (reverse image search)
+
+Each painting is looked up once with Google Cloud Vision's web detection (a reverse image search), using your
+own API key. What Google finds is matched to the work in Wikidata, for its title, artist, date and museum, and
+Apple's Vision compares the photo with the work's image on the device to confirm it:
+
+- **Identified:** the work's image matches your photo.
+- **Possible match:** worth a look; **To Review** in the gallery shows only these. Open one and press **Details**
+  to confirm it, choose another candidate, or type the details yourself.
+- **Unidentified:** nothing fits; you can still type the details.
+
+Details you confirm or type are kept: a later search never replaces them. Only the cropped painting goes to
+Google, without its location or other photo details; Wikidata and Wikimedia Commons receive only the names and IDs
+being looked up.
+
+### Getting a free API key
+
+Google's first 1,000 lookups a month are free, and the app stops at 900. Google still asks for a card to turn
+the service on.
+
+1. Sign in at [console.cloud.google.com](https://console.cloud.google.com) and create a project.
+2. Turn on billing for the project (Billing), then enable the **Cloud Vision API** (APIs & Services › Library).
+3. Create an API key (APIs & Services › Credentials › Create credentials › API key). Restrict it to the Cloud
+   Vision API.
+4. In the app: Settings › Identify paintings, paste the key and press **Save Key**. It is kept in the Keychain.
+
+To be safe from charges, you can also set a budget alert in Billing, or a daily quota on the Cloud Vision API
+(APIs & Services › Cloud Vision API › Quotas).
 
 ## Non-destructive editing
 

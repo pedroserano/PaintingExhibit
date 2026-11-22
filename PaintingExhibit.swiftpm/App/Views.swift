@@ -95,6 +95,8 @@ struct SettingsView: View {
                 Text("You can still show or remove the frame on each painting.")
             }
 
+            IdentifySettings()
+
             Section {
                 Toggle("Save edits to Photos", isOn: $library.saveEditsToPhotos)
                 if library.editedInPhotosCount > 0 {
@@ -125,7 +127,13 @@ struct GalleryView: View {
     /// The painting picked out with the arrow keys (Return or Space opens it).
     @State private var highlighted: String?
     @State private var columnCount = 1
+    @State private var reviewOnly = false
     @FocusState private var gridFocused: Bool
+
+    /// The paintings shown: all of them, or only possible matches waiting to be checked.
+    private var shown: [Painting] {
+        reviewOnly ? library.paintings.filter { $0.identification?.status == .possible } : library.paintings
+    }
 
     private static let minimumWidth: CGFloat = 150, spacing: CGFloat = 12
     private let columns = [GridItem(.adaptive(minimum: GalleryView.minimumWidth), spacing: GalleryView.spacing)]
@@ -137,7 +145,7 @@ struct GalleryView: View {
 
     /// Moves the highlight by `delta` paintings (a whole row for up and down).
     private func move(_ delta: Int) -> KeyPress.Result {
-        let ids = library.paintings.map(\.id)
+        let ids = shown.map(\.id)
         guard !ids.isEmpty else { return .ignored }
         let now = highlighted.flatMap { ids.firstIndex(of: $0) }
         let next = now.map { min(max($0 + delta, 0), ids.count - 1) } ?? 0
@@ -155,6 +163,18 @@ struct GalleryView: View {
                 }
                 .padding(.horizontal)
             }
+            if library.isIdentifying {
+                ProgressView(value: Double(library.identifyDone), total: Double(max(library.identifyTotal, 1))) {
+                    Text("Identifying paintings: \(library.identifyDone) of \(library.identifyTotal)")
+                        .font(.footnote)
+                }
+                .padding(.horizontal)
+            }
+            if reviewOnly {
+                Text(shown.isEmpty ? "No matches left to check." :
+                        "Possible matches to check: open each one and confirm it, choose another, or type the details.")
+                    .font(.footnote).foregroundStyle(.secondary).padding(.horizontal)
+            }
             if let error = library.lastError {
                 Text(error).font(.footnote).foregroundStyle(.orange).padding(.horizontal)
             }
@@ -164,7 +184,7 @@ struct GalleryView: View {
                     .padding(.top, 80)
             }
             LazyVGrid(columns: columns, spacing: Self.spacing) {
-                ForEach(library.paintings) { painting in
+                ForEach(shown) { painting in
                     Button { open(painting) } label: {
                         Thumbnail(painting: painting)
                             .overlay {
@@ -205,8 +225,14 @@ struct GalleryView: View {
             if painting == nil { gridFocused = true }
         }
         }
-        .navigationTitle(library.albumTitle ?? "Exhibit")
+        .navigationTitle(reviewOnly ? "To Review" : (library.albumTitle ?? "Exhibit"))
         .toolbar {
+            if library.toReviewCount > 0 || reviewOnly {
+                Toggle(isOn: $reviewOnly) {
+                    Label("To Review (\(library.toReviewCount))", systemImage: "questionmark.circle")
+                }
+                .help("Show only possible matches to check")
+            }
             Menu {
                 Button("Check for new paintings", systemImage: "arrow.clockwise") {
                     Task { await library.processNew() }
@@ -216,6 +242,12 @@ struct GalleryView: View {
                 }
                 Button("Change album", systemImage: "rectangle.stack") {
                     library.albumID = nil
+                }
+                if library.hasGoogleKey {
+                    Button("Identify paintings", systemImage: "magnifyingglass") {
+                        Task { await library.identifyPending(force: true) }
+                    }
+                    .disabled(library.isIdentifying)
                 }
                 #if os(iOS)
                 Divider()
@@ -238,20 +270,24 @@ struct GalleryView: View {
             }
         }
         .fullScreenCover(item: $selected) { painting in
-            ExhibitView(startID: painting.id) { last in highlighted = last; selected = nil }
-                .environmentObject(library)
+            ExhibitView(startID: painting.id, only: reviewOnly ? shown.map(\.id) : nil) { last in
+                highlighted = last; selected = nil
+            }
+            .environmentObject(library)
         }
         #else
         .overlay {
             if let painting = selected {
-                ExhibitView(startID: painting.id) { last in highlighted = last; selected = nil }
+                ExhibitView(startID: painting.id, only: reviewOnly ? shown.map(\.id) : nil) { last in
+                    highlighted = last; selected = nil
+                }
             }
         }
         #endif
     }
 
     private func openHighlighted() -> KeyPress.Result {
-        guard let id = highlighted, let painting = library.paintings.first(where: { $0.id == id }) else {
+        guard let id = highlighted, let painting = shown.first(where: { $0.id == id }) else {
             return move(0)
         }
         open(painting)
@@ -297,13 +333,23 @@ struct ExhibitView: View {
     @State private var current: String
     @State private var showLabel = true
     @State private var adjusting: Painting?
+    @State private var identifying: Painting?
     @FocusState private var focused: Bool
+    /// The paintings to move through: those in `only`, in album order, or all of them.
+    private let only: [String]?
     /// Closes the exhibit, passing the painting it ended on.
     let onClose: (String) -> Void
 
-    init(startID: String, close: @escaping (String) -> Void) {
+    init(startID: String, only: [String]? = nil, close: @escaping (String) -> Void) {
         _current = State(initialValue: startID)
+        self.only = only
         self.onClose = close
+    }
+
+    private var list: [Painting] {
+        guard let only else { return library.paintings }
+        let wanted = Set(only)
+        return library.paintings.filter { wanted.contains($0.id) }
     }
 
     private func close() { onClose(current) }
@@ -339,6 +385,14 @@ struct ExhibitView: View {
         .onChange(of: current) { focused = true }
         .onChange(of: showLabel) { focused = true }
         .onChange(of: adjusting) { _, editing in if editing == nil { focused = true } }
+        .onChange(of: identifying) { _, open in if open == nil { focused = true } }
+        .sheet(item: $identifying) { painting in
+            IdentityView(paintingID: painting.id) { identifying = nil }
+                .environmentObject(library)
+                #if os(macOS)
+                .frame(minWidth: 620, minHeight: 560)
+                #endif
+        }
         #if os(iOS)
         .statusBarHidden()
         .fullScreenCover(item: $adjusting) { painting in
@@ -352,16 +406,16 @@ struct ExhibitView: View {
         #endif
     }
 
-    private var index: Int? { library.paintings.firstIndex { $0.id == current } }
+    private var index: Int? { list.firstIndex { $0.id == current } }
 
     private func step(_ delta: Int) {
         guard let i = index else { return }
         let next = i + delta
-        guard library.paintings.indices.contains(next) else { return }
+        guard list.indices.contains(next) else { return }
         #if os(iOS)
-        withAnimation { current = library.paintings[next].id }
+        withAnimation { current = list[next].id }
         #else
-        current = library.paintings[next].id
+        current = list[next].id
         #endif
     }
 
@@ -369,7 +423,7 @@ struct ExhibitView: View {
     /// Swipe between paintings.
     private var pages: some View {
         TabView(selection: $current) {
-            ForEach(library.paintings) { painting in
+            ForEach(list) { painting in
                 PaintingPage(painting: painting, showLabel: showLabel, toggleLabel: toggleLabel)
                     .tag(painting.id)
             }
@@ -391,7 +445,7 @@ struct ExhibitView: View {
                         .disabled(index == 0)
                     Spacer()
                     Button { step(1) } label: { Image(systemName: "chevron.right") }
-                        .disabled(index == nil || index == library.paintings.count - 1)
+                        .disabled(index == nil || index == list.count - 1)
                 }
                 .buttonStyle(.plain)
                 .focusable(false)
@@ -423,6 +477,17 @@ struct ExhibitView: View {
                     library.setKeepFrame(!keeps, for: painting.id)
                 } label: {
                     Label(keeps ? "Remove frame" : "Show frame", systemImage: keeps ? "crop" : "square.dashed")
+                        .font(.subheadline)
+                }
+                .buttonStyle(.bordered)
+                .focusable(false)
+                .tint(.white)
+            }
+            if let painting = currentPainting, library.hasGoogleKey || painting.identification != nil {
+                Button {
+                    identifying = painting
+                } label: {
+                    Label(painting.identification == nil ? "Identify" : "Details", systemImage: "magnifyingglass")
                         .font(.subheadline)
                 }
                 .buttonStyle(.bordered)
@@ -483,8 +548,20 @@ struct WallLabel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Not yet identified")
-                .font(.system(.headline, design: .serif))
+            if let id = painting.identification, id.isIdentified, let title = id.title {
+                Text(title)
+                    .font(.system(.headline, design: .serif)).italic()
+                let line = [id.artist, id.year].compactMap { $0 }.joined(separator: ", ")
+                if !line.isEmpty {
+                    Text(line).font(.system(.subheadline, design: .serif))
+                }
+                if let museum = id.museum {
+                    Text(museum).font(.system(.footnote, design: .serif))
+                }
+            } else {
+                Text(painting.identification == nil ? "Not yet identified" : "Unidentified")
+                    .font(.system(.headline, design: .serif))
+            }
             if let date = painting.takenAt {
                 Text("Photographed \(date.formatted(date: .long, time: .omitted))")
                     .font(.system(.subheadline, design: .serif))
@@ -516,6 +593,12 @@ struct WallLabel: View {
         if s.unevenLightFixed { parts.append("spotlight evened") }
         if painting.photosRecipe != nil { parts.append("saved to Photos") }
         if keepsFrame != s.keptFrame && painting.manualCrop == nil { parts.append("updating…") }
+        switch painting.identification?.status {
+        case .matched?: parts.append("identified")
+        case .possible?: parts.append("possible match, to check")
+        case .confirmed?: parts.append("identity confirmed")
+        default: break
+        }
         return parts.joined(separator: " · ")
     }
 }

@@ -19,6 +19,8 @@ struct Painting: Codable, Identifiable, Hashable {
     var photosLeftAlone: Bool?
     /// Corners set by hand, used instead of the automatic crop (kept when paintings are processed again).
     var manualCrop: ManualCrop?
+    /// Which painting this is, once searched for (kept when paintings are processed again).
+    var identification: Identification?
 }
 
 /// One crop fixed by hand: what the app chose and what the person chose instead. Kept as a record to
@@ -81,6 +83,33 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
 
     var editedInPhotosCount: Int { paintings.filter { $0.photosRecipe != nil }.count }
 
+    // MARK: Identification settings
+
+    /// Google's web detection is free for the first 1,000 lookups a month; the app stops below that.
+    static let monthlyLookupLimit = 900
+    /// Whether a Google Cloud Vision API key is saved (the key itself stays in the Keychain).
+    @Published private(set) var hasGoogleKey = APIKeyStore.load() != nil
+    /// Whether new paintings are looked up on their own, once processed.
+    @Published var identifyAutomatically: Bool {
+        didSet {
+            UserDefaults.standard.set(identifyAutomatically, forKey: "identifyAutomatically")
+            if identifyAutomatically && !oldValue { Task { await identifyPending() } }
+        }
+    }
+    @Published private(set) var isIdentifying = false
+    @Published private(set) var identifyDone = 0
+    @Published private(set) var identifyTotal = 0
+    /// Paintings being looked up right now, one at a time.
+    @Published private(set) var searching: Set<String> = []
+
+    private static var monthKey: String {
+        let c = Calendar.current.dateComponents([.year, .month], from: Date())
+        return "googleLookups-\(c.year ?? 0)-\(c.month ?? 0)"
+    }
+    var lookupsThisMonth: Int { UserDefaults.standard.integer(forKey: Self.monthKey) }
+    var lookupsLeft: Int { max(0, Self.monthlyLookupLimit - lookupsThisMonth) }
+    var toReviewCount: Int { paintings.filter { $0.identification?.status == .possible }.count }
+
     let cacheFolder: URL
     private let indexURL: URL
     private var albumFetch: PHFetchResult<PHAsset>?
@@ -110,6 +139,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         _albumID = Published(initialValue: defaults.string(forKey: "albumID"))
         _keepFramesByDefault = Published(initialValue: defaults.bool(forKey: "keepFramesByDefault"))
         _saveEditsToPhotos = Published(initialValue: defaults.bool(forKey: "saveEditsToPhotos"))
+        _identifyAutomatically = Published(initialValue: defaults.object(forKey: "identifyAutomatically") as? Bool ?? true)
         super.init()
 
         #if os(iOS)
@@ -264,6 +294,119 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
             await writeEditsToPhotos()
         } while anotherPass
         isProcessing = false
+        await identifyPending()
+    }
+
+    // MARK: Identifying paintings
+
+    func setGoogleKey(_ key: String?) {
+        let trimmed = key?.trimmingCharacters(in: .whitespacesAndNewlines)
+        APIKeyStore.save(trimmed?.isEmpty == false ? trimmed : nil)
+        hasGoogleKey = APIKeyStore.load() != nil
+        if hasGoogleKey { Task { await identifyPending() } }
+    }
+
+    /// Looks up every painting not yet searched for, when automatic identification is on (or `force`),
+    /// one at a time, stopping at the monthly limit or on an error such as a bad key.
+    func identifyPending(force: Bool = false) async {
+        guard hasGoogleKey, identifyAutomatically || force, !isIdentifying else { return }
+        let pending = paintings.filter { $0.identification == nil }.map(\.id)
+        guard !pending.isEmpty else { return }
+        isIdentifying = true
+        identifyDone = 0
+        identifyTotal = min(pending.count, lookupsLeft)
+        defer { isIdentifying = false }
+        for id in pending {
+            guard lookupsLeft > 0 else {
+                lastError = "Reached this month's \(Self.monthlyLookupLimit) Google lookups; the rest will be identified next month."
+                return
+            }
+            guard paintings.contains(where: { $0.id == id && $0.identification == nil }) else { continue }
+            do {
+                try await identify(id)
+            } catch {
+                lastError = error.localizedDescription
+                return
+            }
+            identifyDone += 1
+        }
+    }
+
+    /// Searches for one painting (using one of the month's lookups) and stores what was found. A painting
+    /// confirmed by hand keeps its details; the new search only refreshes the other candidates.
+    func identify(_ id: String) async throws {
+        guard let key = APIKeyStore.load() else { throw IdentifyError.noKey }
+        guard lookupsLeft > 0 else {
+            throw IdentifyError.google("this month's \(Self.monthlyLookupLimit) free lookups are used up")
+        }
+        guard let painting = paintings.first(where: { $0.id == id }),
+              let url = await imageURL(for: painting) else { throw IdentifyError.noImage }
+        searching.insert(id)
+        defer { searching.remove(id) }
+        UserDefaults.standard.set(lookupsThisMonth + 1, forKey: Self.monthKey)
+        let found = try await Identifier.identify(imageAt: url, apiKey: key)
+        guard let i = paintings.firstIndex(where: { $0.id == id }) else { return }
+        if var kept = paintings[i].identification, kept.status == .confirmed {
+            kept.candidates = found.candidates
+            kept.pages = found.pages
+            kept.clues = found.clues
+            kept.guess = found.guess
+            kept.searchedAt = found.searchedAt
+            paintings[i].identification = kept
+        } else {
+            paintings[i].identification = found
+        }
+        save()
+    }
+
+    /// Takes one of the candidates as the painting, confirmed.
+    func confirm(_ candidate: Candidate, for id: String) {
+        guard let i = paintings.firstIndex(where: { $0.id == id }) else { return }
+        var identity = paintings[i].identification ?? Identification(status: .confirmed)
+        identity.apply(candidate)
+        identity.status = .confirmed
+        paintings[i].identification = identity
+        save()
+    }
+
+    /// Sets the painting's details by hand (confirmed), or marks it unidentified when the title is empty.
+    func setDetails(title: String, artist: String, year: String, museum: String, for id: String) {
+        guard let i = paintings.firstIndex(where: { $0.id == id }) else { return }
+        func clean(_ s: String) -> String? {
+            let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            return t.isEmpty ? nil : t
+        }
+        var identity = paintings[i].identification ?? Identification(status: .confirmed)
+        let typed = (clean(title), clean(artist), clean(year), clean(museum))
+        if typed != (identity.title, identity.artist, identity.year, identity.museum) {
+            identity.wikidata = nil
+            identity.link = nil
+            identity.distance = nil
+        }
+        (identity.title, identity.artist, identity.year, identity.museum) = typed
+        identity.status = typed.0 == nil ? .unidentified : .confirmed
+        paintings[i].identification = identity
+        save()
+    }
+
+    /// Accepts the automatic match as it is.
+    func acceptMatch(for id: String) {
+        guard let i = paintings.firstIndex(where: { $0.id == id }), paintings[i].identification?.title != nil else { return }
+        paintings[i].identification?.status = .confirmed
+        save()
+    }
+
+    /// Rejects the automatic match: the painting is left unidentified, with its candidates kept to choose from.
+    func rejectMatch(for id: String) {
+        guard let i = paintings.firstIndex(where: { $0.id == id }) else { return }
+        var identity = paintings[i].identification ?? Identification(status: .unidentified)
+        identity.status = .unidentified
+        (identity.title, identity.artist, identity.year, identity.museum) = (nil, nil, nil, nil)
+        identity.wikidata = nil
+        identity.link = nil
+        identity.distance = nil
+        paintings[i].identification = identity
+        save()
     }
 
     private func runPass(reprocessAll: Bool) async {
@@ -341,7 +484,8 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                     version: Self.processingVersion,
                     photosRecipe: previous?.photosRecipe,
                     photosLeftAlone: previous?.photosLeftAlone,
-                    manualCrop: manual
+                    manualCrop: manual,
+                    identification: previous?.identification
                 )
                 if let i = paintings.firstIndex(where: { $0.id == id }) {
                     paintings[i] = painting
