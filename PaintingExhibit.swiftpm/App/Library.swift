@@ -85,9 +85,9 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     private let indexURL: URL
     private var albumFetch: PHFetchResult<PHAsset>?
     private var stale: Set<String> = []          // photos edited elsewhere since they were analysed
-    /// Every crop fixed by hand, one JSON record per line.
+    /// Every crop fixed by hand, one JSON record per line (in the app's Application Support folder), for
+    /// measuring and improving the automatic cropping.
     let fixesURL: URL
-    @Published private(set) var fixCount = 0
     private var ownWrites: [String: Date] = [:]  // photos this app just changed, so their change notice is ignored
     private var forceAll = false
     private var anotherPass = false
@@ -111,7 +111,6 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         _keepFramesByDefault = Published(initialValue: defaults.bool(forKey: "keepFramesByDefault"))
         _saveEditsToPhotos = Published(initialValue: defaults.bool(forKey: "saveEditsToPhotos"))
         super.init()
-        fixCount = (try? String(contentsOf: fixesURL, encoding: .utf8))?.split(separator: "\n").count ?? 0
 
         #if os(iOS)
         // Version 0.1 kept full copies in the app's own Documents folder and cache; the new cache replaces them.
@@ -233,7 +232,6 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
             } else {
                 try? Data(text.utf8).write(to: fixesURL)
             }
-            fixCount += 1
         }
         paintings[i].manualCrop = quad.map { ManualCrop(quad: $0, lensK: lensK) }
         stale.insert(id)

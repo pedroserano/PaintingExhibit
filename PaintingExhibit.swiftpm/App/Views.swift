@@ -96,19 +96,6 @@ struct SettingsView: View {
             }
 
             Section {
-                LabeledContent("Crops fixed by hand", value: "\(library.fixCount)")
-                if library.fixCount > 0 {
-                    ShareLink(item: library.fixesURL) {
-                        Label("Export Fixes", systemImage: "square.and.arrow.up")
-                    }
-                }
-            } footer: {
-                Text("""
-                Each crop you adjust is recorded with what the app had chosen, so the automatic cropping can be                 measured against your fixes and improved. Export the record to share it.
-                """)
-            }
-
-            Section {
                 Toggle("Save edits to Photos", isOn: $library.saveEditsToPhotos)
                 if library.editedInPhotosCount > 0 {
                     Button("Remove Edits from Photos (\(library.editedInPhotosCount))", role: .destructive) {

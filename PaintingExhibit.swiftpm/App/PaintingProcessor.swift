@@ -416,7 +416,7 @@ enum PaintingProcessor {
             .first { quad in pixels.map { !isWallFeature(quad, in: $0) } ?? true }
             .flatMap(shaped)
         guard var quad = forcedQuad
-                ?? foregroundQuad(in: baseCG).flatMap(shaped)
+                ?? subjectFinder(baseCG).flatMap(shaped)
                 ?? rectangle
                 ?? shaped(documentQuad(in: baseCG))
                 // Otherwise assume the painting fills the photo, with its frame near the edges or out of shot.
@@ -527,10 +527,12 @@ enum PaintingProcessor {
             .sorted { area(of: $0) > area(of: $1) }
     }
 
+    /// Finds the painting as the photo's main object; Apple's foreground segmentation unless replaced.
+    nonisolated(unsafe) static var subjectFinder: (CGImage) -> [NormPoint]? = foregroundQuad
+
     /// The photo's subject as Vision separates it from the background (the object at the centre of the photo,
-    /// else the largest), as a quad through its outermost corners. Only a rectangular subject counts — a painting
-    /// in its frame fills its outline almost completely; a figure picked out of a painting doesn't.
-    private static func foregroundQuad(in image: CGImage) -> [NormPoint]? {
+    /// else the largest), as a quad through its outermost corners, if it is rectangular.
+    static func foregroundQuad(in image: CGImage) -> [NormPoint]? {
         let request = VNGenerateForegroundInstanceMaskRequest()
         guard (try? VNImageRequestHandler(cgImage: image, options: [:]).perform([request])) != nil,
               let observation = request.results?.first else { return nil }
@@ -543,13 +545,20 @@ enum PaintingProcessor {
         for y in 0..<h { for x in 0..<w where base[y * row + x] > 0 { counts[base[y * row + x], default: 0] += 1 } }
         var label = base[(h / 2) * row + w / 2]
         if label == 0 { label = counts.max { $0.value < $1.value }?.key ?? 0 }
-        guard label > 0, let pixels = counts[label] else { return nil }
+        guard label > 0 else { return nil }
+        return rectangularQuad(width: w, height: h) { x, y in base[y * row + x] == label }
+    }
 
-        // Outermost corners (row 0 at the top): top-left has the smallest x + y, and so on.
+    /// The quad through a mask's outermost corners (row 0 at the top), if the mask is rectangular: a painting in
+    /// its frame fills its outline and doesn't spill outside it; a face or a tree, whose outermost points make a
+    /// diamond, spills well outside.
+    static func rectangularQuad(width w: Int, height h: Int, isOn: (Int, Int) -> Bool) -> [NormPoint]? {
+        var pixels = 0
         var tl = (Double.infinity, SIMD2<Double>(0, 0)), br = (-Double.infinity, SIMD2<Double>(0, 0))
         var tr = (-Double.infinity, SIMD2<Double>(0, 0)), bl = (Double.infinity, SIMD2<Double>(0, 0))
         for y in 0..<h {
-            for x in 0..<w where base[y * row + x] == label {
+            for x in 0..<w where isOn(x, y) {
+                pixels += 1
                 let p = SIMD2((Double(x) + 0.5) / Double(w), (Double(y) + 0.5) / Double(h))
                 if p.x + p.y < tl.0 { tl = (p.x + p.y, p) }
                 if p.x + p.y > br.0 { br = (p.x + p.y, p) }
@@ -557,12 +566,11 @@ enum PaintingProcessor {
                 if p.x - p.y < bl.0 { bl = (p.x - p.y, p) }
             }
         }
+        guard pixels > 0 else { return nil }
         let corners = [tl.1, tr.1, br.1, bl.1]
         let quad = corners.map { NormPoint(x: $0.x, y: 1 - $0.y) }
         let outline = Double(area(of: quad))
         guard outline >= 0.15, isConvex(quad) else { return nil }
-        // A rectangle fills its outline and doesn't spill outside it; a face or a tree, whose outermost points
-        // make a diamond, spills well outside.
         func inside(_ p: SIMD2<Double>) -> Bool {
             (0..<4).allSatisfy { i in
                 let a = corners[i], b = corners[(i + 1) % 4]
@@ -571,7 +579,7 @@ enum PaintingProcessor {
         }
         var outside = 0
         for y in stride(from: 0, to: h, by: 2) {
-            for x in stride(from: 0, to: w, by: 2) where base[y * row + x] == label {
+            for x in stride(from: 0, to: w, by: 2) where isOn(x, y) {
                 if !inside(SIMD2((Double(x) + 0.5) / Double(w), (Double(y) + 0.5) / Double(h))) { outside += 4 }
             }
         }

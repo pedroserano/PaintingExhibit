@@ -53,7 +53,8 @@ Your paintings and frame choices are kept.
 - **Adjust Crop** on any painting shows the photo with the crop's four corners; drag them onto the painting's
   corners (a magnifier shows the spot under your finger) and Save. Your corners are kept when paintings are
   processed again; **Use Automatic Crop** goes back. Each fix is recorded next to what the app had chosen
-  (Settings › Export Fixes), as the answer key for measuring and improving the automatic cropping.
+  (`crop-fixes.jsonl` in the app's Application Support folder), as the answer key for measuring and improving
+  the automatic cropping.
 - Pinch or double-tap to zoom; swipe to the next painting when not zoomed or at the edge.
 - Settings: ⋯ menu › Settings on iPhone and iPad, ⌘, on the Mac.
 
