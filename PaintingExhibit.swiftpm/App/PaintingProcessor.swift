@@ -24,18 +24,6 @@ struct NormPoint: Codable, Hashable {
     var y: Double
 }
 
-/// A painting's overall colour, in CIE L*a*b*: the average and the spread of each channel.
-struct ColourStats: Codable, Hashable {
-    var mean: SIMD3<Float>
-    var spread: SIMD3<Float>
-}
-
-/// A shift of a photo's colours, in L*a*b*: each channel becomes value × scale + offset.
-struct ColourMatch: Codable, Hashable {
-    var scale: SIMD3<Float>
-    var offset: SIMD3<Float>
-}
-
 /// Corners someone set by hand (top-left, top-right, bottom-right, bottom-left, in the photo with lens
 /// distortion `lensK` undone), used in place of the automatic crop.
 struct ManualCrop: Codable, Hashable {
@@ -76,11 +64,6 @@ struct ProcessingSettings: Codable, Hashable {
     /// Exposure, computed on first render. Nil means "work it out again" (e.g. after the frame choice changes).
     var blackPoint: Float?
     var exposure: Float?
-
-    /// The painting's colour after the corrections above, measured at the last render (before `colourMatch`).
-    var colourStats: ColourStats?
-    /// A shift that brings this photo's colours in line with other photos of the same painting.
-    var colourMatch: ColourMatch?
 
     var cropFound: Bool { paintingQuad != nil }
     var frameFound: Bool { canvasQuad != nil }
@@ -461,7 +444,8 @@ enum PaintingProcessor {
 
         // 3. Work out the corrections from the wall. Its colour isn't used for white balance: which bit of wall
         // (and frame) ends up beside the crop varies from photo to photo, and on photos of the same painting
-        // that made the colours differ far more than the cameras' own white balance did.
+        // that made the colours differ far more than the cameras' own white balance did. Estimating the light
+        // from the painting itself (grey world and the like) drains the colour of warm, varnished paintings.
         if wall.average != nil {
             // Spotlight falloff: brighten the side of the canvas next to the darker wall.
             if let l = wall.left, let r = wall.right {
@@ -1209,27 +1193,6 @@ enum PaintingProcessor {
         }
         let black = settings.blackPoint ?? 0
         let exposure = settings.exposure ?? 1
-        let match = settings.colourMatch
-
-        // The painting's colour after the corrections, before any matching (sampled).
-        var sum = SIMD3<Double>(repeating: 0), sumSquares = SIMD3<Double>(repeating: 0), samples = 0.0
-        toLinear.withUnsafeBufferPointer { lin in
-            let step = max(1, Int((Double(w * h) / 60_000).squareRoot()))
-            for y in stride(from: h / 20, to: h - h / 20, by: step) {
-                for x in stride(from: w / 20, to: w - w / 20, by: step) {
-                    let g = colGain[x] * rowGain[y], o = (y * w + x) * 4
-                    var rgb = SIMD3<Float>(repeating: 0)
-                    for c in 0..<3 { rgb[c] = max(0, min(1, (lin[Int(px[o + c])] * wb[c] * g - black) * exposure)) }
-                    let lab = SIMD3<Double>(toLab(rgb))
-                    sum += lab; sumSquares += lab * lab; samples += 1
-                }
-            }
-        }
-        if samples > 0 {
-            let mean = sum / samples
-            let variance = simd_max(sumSquares / samples - mean * mean, SIMD3<Double>(repeating: 0))
-            settings.colourStats = ColourStats(mean: SIMD3<Float>(mean), spread: SIMD3<Float>(variance.squareRoot()))
-        }
 
         toLinear.withUnsafeBufferPointer { lin in
             toSRGB.withUnsafeBufferPointer { out in
@@ -1239,10 +1202,11 @@ enum PaintingProcessor {
                     for x in 0..<w {
                         let g = colGain[x] * rg
                         let o = (y * w + x) * 4
-                        var rgb = SIMD3<Float>(repeating: 0)
-                        for c in 0..<3 { rgb[c] = max(0, min(1, (lin[Int(px[o + c])] * wb[c] * g - black) * exposure)) }
-                        if let match { rgb = fromLab(toLab(rgb) * match.scale + match.offset) }
-                        for c in 0..<3 { px[o + c] = out[Int(max(0, min(1, rgb[c])) * top)] }
+                        for c in 0..<3 {
+                            var v = (lin[Int(px[o + c])] * wb[c] * g - black) * exposure
+                            v = max(0, min(1, v))
+                            px[o + c] = out[Int(v * top)]
+                        }
                         px[o + 3] = 255
                     }
                 }
@@ -1251,74 +1215,6 @@ enum PaintingProcessor {
 
         guard let result = ctx.makeImage() else { throw ProcessingError.renderFailed }
         return result
-    }
-
-    // MARK: Matching photos of the same painting
-
-    /// The shift that brings colours measured as `from` to `to` (average and spread of each L*a*b* channel),
-    /// limited to a moderate change so a mismatched photo can't be pushed far.
-    static func colourMatch(from: ColourStats, to: ColourStats) -> ColourMatch? {
-        var scale = SIMD3<Float>(repeating: 1), offset = SIMD3<Float>(repeating: 0)
-        for c in 0..<3 {
-            // value' = (value − from.mean) × scale + target, with the target mean moved at most `limit`.
-            scale[c] = clamp(to.spread[c] / max(from.spread[c], 0.5), 0.8, 1.25)
-            let limit: Float = c == 0 ? 12 : 10     // L* up to 12, a* and b* up to 10
-            let target = from.mean[c] + clamp(to.mean[c] - from.mean[c], -limit, limit)
-            offset[c] = target - from.mean[c] * scale[c]
-        }
-        let change = simd_length(from.mean * scale + offset - from.mean)
-        return change < 1 && simd_length(scale - 1) < 0.03 ? nil : ColourMatch(scale: scale, offset: offset)
-    }
-
-    /// A summary of an image's content for recognising other photos of the same painting.
-    static func featurePrint(of image: URL) -> Data? {
-        let request = VNGenerateImageFeaturePrintRequest()
-        guard (try? VNImageRequestHandler(url: image, options: [:]).perform([request])) != nil,
-              let print = request.results?.first else { return nil }
-        return try? NSKeyedArchiver.archivedData(withRootObject: print, requiringSecureCoding: true)
-    }
-
-    /// Groups of images showing the same painting: those whose feature prints are closer than `threshold`
-    /// (about 0.4 for the same painting photographed again), joined in chains. Returns groups of indices;
-    /// images that match nothing are left out.
-    static func sameSubjectGroups(_ prints: [Data?], threshold: Float = 0.4) -> [[Int]] {
-        let observations = prints.map { data in
-            data.flatMap { try? NSKeyedUnarchiver.unarchivedObject(ofClass: VNFeaturePrintObservation.self, from: $0) }
-        }
-        var parent = Array(prints.indices)
-        func root(_ i: Int) -> Int {
-            var i = i
-            while parent[i] != i { parent[i] = parent[parent[i]]; i = parent[i] }
-            return i
-        }
-        for i in observations.indices {
-            guard let a = observations[i] else { continue }
-            for j in (i + 1)..<observations.count {
-                guard let b = observations[j] else { continue }
-                var d: Float = 0
-                if (try? a.computeDistance(&d, to: b)) != nil, d < threshold { parent[root(i)] = root(j) }
-            }
-        }
-        return Dictionary(grouping: prints.indices, by: root).values.filter { $0.count > 1 }.map { $0.sorted() }
-    }
-
-    // Linear sRGB ⇄ CIE L*a*b* (D65).
-    private static func toLab(_ rgb: SIMD3<Float>) -> SIMD3<Float> {
-        let x = (0.4124 * rgb.x + 0.3576 * rgb.y + 0.1805 * rgb.z) / 0.95047
-        let y = 0.2126 * rgb.x + 0.7152 * rgb.y + 0.0722 * rgb.z
-        let z = (0.0193 * rgb.x + 0.1192 * rgb.y + 0.9505 * rgb.z) / 1.08883
-        func f(_ t: Float) -> Float { t > 0.008856 ? cbrtf(t) : 7.787 * t + 16 / 116 }
-        let fx = f(x), fy = f(y), fz = f(z)
-        return SIMD3(116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz))
-    }
-
-    private static func fromLab(_ lab: SIMD3<Float>) -> SIMD3<Float> {
-        let fy = (lab.x + 16) / 116, fx = fy + lab.y / 500, fz = fy - lab.z / 200
-        func g(_ t: Float) -> Float { t > 0.206893 ? t * t * t : (t - 16 / 116) / 7.787 }
-        let x = g(fx) * 0.95047, y = g(fy), z = g(fz) * 1.08883
-        return SIMD3(3.2406 * x - 1.5372 * y - 0.4986 * z,
-                     -0.9689 * x + 1.8758 * y + 0.0415 * z,
-                     0.0557 * x - 0.2040 * y + 1.0570 * z)
     }
 
     private static func clamp(_ v: Float, _ lo: Float, _ hi: Float) -> Float { max(lo, min(hi, v)) }

@@ -19,10 +19,6 @@ struct Painting: Codable, Identifiable, Hashable {
     var photosLeftAlone: Bool?
     /// Corners set by hand, used instead of the automatic crop (kept when paintings are processed again).
     var manualCrop: ManualCrop?
-    /// A summary of the drawn painting's content, for finding other photos of the same painting.
-    var featurePrint: Data?
-    /// The colour shift this photo should be drawn with, to match other photos of the same painting.
-    var colourMatch: ColourMatch?
 }
 
 /// One crop fixed by hand: what the app chose and what the person chose instead. Kept as a record to
@@ -49,7 +45,7 @@ struct CropFix: Codable {
 @MainActor
 final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     /// Bump this when the analysis changes, so older recipes are worked out again.
-    static let processingVersion = 9
+    static let processingVersion = 10
     /// Identifies this app's edits in Photos, so it can recognise and redo them.
     nonisolated static let adjustmentFormat = "com.pedroserano.PaintingExhibit.recipe"
     /// Long side of the photo when drawing an edit for Photos (the exhibit cache uses less).
@@ -265,7 +261,6 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
             let all = forceAll
             forceAll = false
             await runPass(reprocessAll: all)
-            if await matchColours() { anotherPass = true }
             await writeEditsToPhotos()
         } while anotherPass
         isProcessing = false
@@ -293,7 +288,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                 todo.append((asset, .analyze))
                 return
             }
-            if (p.manualCrop == nil && p.settings.keptFrame != self.keepsFrame(p)) || p.colourMatch != p.settings.colourMatch {
+            if p.manualCrop == nil, p.settings.keptFrame != self.keepsFrame(p) {
                 todo.append((asset, .redraw))
             }
         }
@@ -321,12 +316,9 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
 
                 let settings: ProcessingSettings
                 if job == .redraw, var recipe = previous?.settings {
-                    if previous?.manualCrop == nil, recipe.keptFrame != keep {
-                        recipe.keptFrame = keep
-                        recipe.blackPoint = nil     // the frame changes the brightness range
-                        recipe.exposure = nil
-                    }
-                    recipe.colourMatch = previous?.colourMatch
+                    recipe.keptFrame = keep
+                    recipe.blackPoint = nil     // the frame changes the brightness range
+                    recipe.exposure = nil
                     let fixed = recipe
                     settings = try await Task.detached(priority: .userInitiated) {
                         try PaintingProcessor.render(imageData: data, settings: fixed, writeTo: url)
@@ -349,10 +341,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                     version: Self.processingVersion,
                     photosRecipe: previous?.photosRecipe,
                     photosLeftAlone: previous?.photosLeftAlone,
-                    manualCrop: manual,
-                    // A new analysis may crop differently, so its content summary is worked out again.
-                    featurePrint: job == .redraw ? previous?.featurePrint : nil,
-                    colourMatch: previous?.colourMatch
+                    manualCrop: manual
                 )
                 if let i = paintings.firstIndex(where: { $0.id == id }) {
                     paintings[i] = painting
@@ -367,54 +356,6 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
             }
             progressDone += 1
         }
-    }
-
-    // MARK: Matching photos of the same painting
-
-    /// Finds photos of the same painting and works out, for each, a colour shift towards the group's typical
-    /// colour (the median of their averages and spreads), so they look alike. Returns whether any painting now
-    /// needs redrawing with a new shift.
-    private func matchColours() async -> Bool {
-        // Content summaries for paintings that don't have one yet.
-        for i in paintings.indices where paintings[i].featurePrint == nil {
-            let url = cacheFolder.appendingPathComponent(paintings[i].fileName)
-            guard FileManager.default.fileExists(atPath: url.path) else { continue }
-            paintings[i].featurePrint = await Task.detached(priority: .utility) {
-                PaintingProcessor.featurePrint(of: url)
-            }.value
-        }
-        let prints = paintings.map(\.featurePrint)
-        let groups = await Task.detached(priority: .utility) {
-            PaintingProcessor.sameSubjectGroups(prints)
-        }.value
-
-        var wanted = [String: ColourMatch]()
-        for group in groups {
-            let stats = group.compactMap { paintings[$0].settings.colourStats }
-            guard stats.count > 1 else { continue }
-            func median(_ values: [Float]) -> Float {
-                let sorted = values.sorted()
-                return sorted.count % 2 == 1 ? sorted[sorted.count / 2] : (sorted[sorted.count / 2 - 1] + sorted[sorted.count / 2]) / 2
-            }
-            var target = ColourStats(mean: .zero, spread: .zero)
-            for c in 0..<3 {
-                target.mean[c] = median(stats.map { $0.mean[c] })
-                target.spread[c] = median(stats.map { $0.spread[c] })
-            }
-            for i in group {
-                guard let own = paintings[i].settings.colourStats else { continue }
-                wanted[paintings[i].id] = PaintingProcessor.colourMatch(from: own, to: target)
-            }
-        }
-        var changed = false
-        for i in paintings.indices {
-            let match = wanted[paintings[i].id]
-            // Another pass only when the wanted shift changed (the pass redraws any painting not drawn with it).
-            if match != paintings[i].colourMatch { changed = true }
-            paintings[i].colourMatch = match
-        }
-        save()
-        return changed
     }
 
     // MARK: Saving edits to Photos
