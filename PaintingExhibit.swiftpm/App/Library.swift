@@ -400,7 +400,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     }
 
     /// Bump when the search improves, so paintings it couldn't place are tried again.
-    static let searchVersion = 2
+    static let searchVersion = 3
 
     private func needsSearch(_ p: Painting) -> Bool {
         guard let id = p.identification else { return true }

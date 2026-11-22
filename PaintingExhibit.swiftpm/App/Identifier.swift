@@ -88,9 +88,9 @@ enum IdentifyError: LocalizedError {
 /// and Wikimedia Commons receive only the names and IDs being looked up.
 enum Identifier {
     /// Distances (1 − similarity of MobileCLIP fingerprints) at or under this are the same painting. Measured on
-    /// hand-checked pairs from the album against works' images: the same painting came out 0.03–0.15, different
-    /// paintings 0.10 and over (mostly far more), so matches between the two are left to be checked.
-    static let sameWork: Float = 0.08
+    /// the album's Cleveland photos: every match came out 0.02–0.07 against the museum's image, and the nearest
+    /// other painting 0.18 or more; between this and `likelyWork` matches are left to be checked.
+    static let sameWork: Float = 0.10
     /// Distances at or under this are probably the same painting, or another version of it.
     static let likelyWork: Float = 0.14
     /// Identifies the client to Wikidata and Wikimedia Commons, as they ask.
