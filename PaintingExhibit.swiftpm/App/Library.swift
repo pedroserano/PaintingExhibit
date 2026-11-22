@@ -23,6 +23,10 @@ struct Painting: Codable, Identifiable, Hashable {
     var photoText: [String]?
     /// Which painting this is, once searched for (kept when paintings are processed again).
     var identification: Identification?
+    /// When the crop, white balance or frame choice was last changed by hand, and the identification last
+    /// changed, for sharing between devices (the newer wins).
+    var editedAt: Date?
+    var identifiedAt: Date?
 }
 
 /// One crop fixed by hand: what the app chose and what the person chose instead. Kept as a record to
@@ -39,6 +43,8 @@ struct CropFix: Codable {
     var manual: [NormPoint]?
     var lensK: Double?
     var frameRemoved: Bool
+    /// The photo's iCloud Photos ID, the same on every device (the Photos ID differs).
+    var cloud: String?
 }
 
 /// Keeps the edit recipes, watches the paintings album, and draws paintings from Photos.
@@ -231,7 +237,139 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         guard let i = paintings.firstIndex(where: { $0.id == id }) else { return }
         paintings[i].keepFrame = keep
         save()
+        edited(id)
         Task { await processNew() }
+    }
+
+    // MARK: Sharing between devices
+
+    @Published private(set) var sharedFolderName: String? = SharedFolder.displayName
+    private var cloudIDs: [String: String] = [:]     // Photos ID on this device → iCloud Photos ID
+    private var syncing = false
+    private var syncAgain = false
+
+    /// Chooses the folder to share edits, identifications and museum data through (nil: stop sharing), and
+    /// brings what's already there in.
+    func chooseSharedFolder(_ url: URL?) {
+        SharedFolder.choose(url)
+        sharedFolderName = SharedFolder.displayName
+        if let url {
+            // Carry over the crop fixes and museum data fetched so far, so nothing is fetched twice.
+            let local = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("PaintingExhibit", isDirectory: true)
+            let museums = local.appendingPathComponent("Museums")
+            let sharedMuseums = url.appendingPathComponent("Museums")
+            try? FileManager.default.createDirectory(at: sharedMuseums, withIntermediateDirectories: true)
+            for file in (try? FileManager.default.contentsOfDirectory(atPath: museums.path)) ?? [] {
+                let target = sharedMuseums.appendingPathComponent(file)
+                if !FileManager.default.fileExists(atPath: target.path) {
+                    try? FileManager.default.copyItem(at: museums.appendingPathComponent(file), to: target)
+                }
+            }
+            if let fixes = try? String(contentsOf: fixesURL, encoding: .utf8), !fixes.isEmpty,
+               SharedFolder.read("crop-fixes.jsonl") == nil {
+                SharedFolder.write(Data(fixes.utf8), to: "crop-fixes.jsonl")
+            }
+        }
+        Task { await syncShared() }
+    }
+
+    /// The iCloud Photos IDs of this device's photos (the same picture has a different Photos ID on each device).
+    private func cloudID(_ localIDs: [String]) -> [String: String] {
+        let missing = localIDs.filter { cloudIDs[$0] == nil }
+        if !missing.isEmpty {
+            for (local, result) in PHPhotoLibrary.shared().cloudIdentifierMappings(forLocalIdentifiers: missing) {
+                if case .success(let cloud) = result { cloudIDs[local] = cloud.stringValue }
+            }
+        }
+        return cloudIDs
+    }
+
+    /// Notes that a painting's edits (crop, colour, frame) changed here, and shares them.
+    private func edited(_ id: String) {
+        guard let i = paintings.firstIndex(where: { $0.id == id }) else { return }
+        paintings[i].editedAt = Date()
+        save()
+        Task { await syncShared() }
+    }
+
+    /// Notes that a painting's identification changed here, and shares it.
+    private func identified(_ id: String) {
+        guard let i = paintings.firstIndex(where: { $0.id == id }) else { return }
+        paintings[i].identifiedAt = Date()
+        save()
+        Task { await syncShared() }
+    }
+
+    /// Brings in what other devices shared and shares what changed here: for each painting the newer edits win,
+    /// and an identification confirmed by hand beats an automatic one. Edits from elsewhere redraw the painting.
+    func syncShared() async {
+        guard SharedFolder.url != nil else { return }
+        if syncing { syncAgain = true; return }
+        syncing = true
+        defer { syncing = false }
+        repeat {
+            syncAgain = false
+            var shared: [String: SharedEntry] = [:]
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            if let data = await Task.detached(operation: { SharedFolder.read("edits.json") }).value {
+                shared = (try? decoder.decode([String: SharedEntry].self, from: data)) ?? [:]
+            }
+            let ids = cloudID(paintings.map(\.id))
+            var changedShared = false, redraw = false
+            for i in paintings.indices {
+                guard let key = ids[paintings[i].id] else { continue }
+                var entry = shared[key] ?? SharedEntry()
+                let p = paintings[i]
+
+                // Edits: the newer side wins.
+                let mine = p.editedAt ?? .distantPast, theirs = entry.editedAt ?? .distantPast
+                if theirs > mine {
+                    if entry.manualCrop != p.manualCrop || entry.colour != p.settings.colour {
+                        paintings[i].manualCrop = entry.manualCrop
+                        paintings[i].settings.colour = entry.colour
+                        stale.insert(p.id)
+                        redraw = true
+                    }
+                    if entry.keepFrame != p.keepFrame {
+                        paintings[i].keepFrame = entry.keepFrame
+                        redraw = true
+                    }
+                    paintings[i].editedAt = entry.editedAt
+                } else if mine > theirs {
+                    entry.manualCrop = p.manualCrop
+                    entry.colour = p.settings.colour
+                    entry.keepFrame = p.keepFrame
+                    entry.editedAt = p.editedAt
+                    changedShared = true
+                }
+
+                // Identification: confirmed by hand beats automatic, then the newer wins.
+                func rank(_ id: Identification?, _ at: Date?) -> (Int, Date) {
+                    (id?.status == .confirmed ? 2 : id == nil ? 0 : 1, at ?? id?.searchedAt ?? .distantPast)
+                }
+                let mineID = rank(p.identification, p.identifiedAt), theirsID = rank(entry.identification, entry.identifiedAt)
+                if theirsID > mineID, let theirs = entry.identification {
+                    paintings[i].identification = theirs
+                    paintings[i].identifiedAt = entry.identifiedAt ?? theirs.searchedAt
+                } else if mineID > theirsID, let mine = p.identification {
+                    entry.identification = mine
+                    entry.identifiedAt = p.identifiedAt ?? mine.searchedAt
+                    changedShared = true
+                }
+                shared[key] = entry
+            }
+            save()
+            if changedShared {
+                let encoder = JSONEncoder()
+                encoder.dateEncodingStrategy = .iso8601
+                if let data = try? encoder.encode(shared) {
+                    await Task.detached { SharedFolder.write(data, to: "edits.json") }.value
+                }
+            }
+            if redraw { Task { await processNew() } }
+        } while syncAgain
     }
 
     // MARK: Showing the original
@@ -283,6 +421,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
             paintings[j].settings = drawn
             paintings[j].renderedAt = Date()
             save()
+            edited(id)
             if saveEditsToPhotos { await processNew() }
         } catch {
             lastError = "The painting couldn't be redrawn: \(error.localizedDescription)"
@@ -315,11 +454,13 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         let replaced = painting.manualCrop?.quad ?? (painting.settings.paintingQuad == nil ? nil : currentCrop(of: painting))
         let fix = CropFix(date: Date(), photo: id, processingVersion: Self.processingVersion,
                           automatic: replaced, replacedManual: painting.manualCrop != nil, manual: quad,
-                          lensK: lensK, frameRemoved: painting.settings.frameRemoved)
+                          lensK: lensK, frameRemoved: painting.settings.frameRemoved,
+                          cloud: cloudID([id])[id])
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         if let line = try? encoder.encode(fix), var text = String(data: line, encoding: .utf8) {
             text += "\n"
+            if SharedFolder.url != nil { SharedFolder.append(text, to: "crop-fixes.jsonl") }
             if let handle = try? FileHandle(forWritingTo: fixesURL) {
                 handle.seekToEndOfFile()
                 handle.write(Data(text.utf8))
@@ -331,6 +472,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         paintings[i].manualCrop = quad.map { ManualCrop(quad: $0, lensK: lensK) }
         stale.insert(id)
         save()
+        edited(id)
         Task { await processNew() }
     }
 
@@ -359,6 +501,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
             await writeEditsToPhotos()
         } while anotherPass
         isProcessing = false
+        await syncShared()
         await identifyPending()
     }
 
@@ -396,7 +539,9 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                 lastError = error.localizedDescription
             }
             identifyDone += 1
+            if identifyDone % 25 == 0 { await syncShared() }
         }
+        await syncShared()
     }
 
     /// Bump when the search improves, so paintings it couldn't place are tried again.
@@ -564,6 +709,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
             paintings[i].identification = kept
         }
         save()
+        identified(id)
         return found.status == .matched
     }
 
@@ -575,6 +721,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         identity.status = .confirmed
         paintings[i].identification = identity
         save()
+        identified(id)
     }
 
     /// Sets the painting's details by hand (confirmed), or marks it unidentified when the title is empty.
@@ -595,6 +742,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         identity.status = typed.0 == nil ? .unidentified : .confirmed
         paintings[i].identification = identity
         save()
+        identified(id)
     }
 
     /// Accepts the automatic match as it is.
@@ -602,6 +750,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         guard let i = paintings.firstIndex(where: { $0.id == id }), paintings[i].identification?.title != nil else { return }
         paintings[i].identification?.status = .confirmed
         save()
+        identified(id)
     }
 
     /// Rejects the automatic match: the painting is left unidentified, with its candidates kept to choose from.
@@ -615,6 +764,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         identity.distance = nil
         paintings[i].identification = identity
         save()
+        identified(id)
     }
 
     private func runPass(reprocessAll: Bool) async {
@@ -696,7 +846,9 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                     photosLeftAlone: previous?.photosLeftAlone,
                     manualCrop: manual,
                     photoText: previous?.photoText,
-                    identification: previous?.identification
+                    identification: previous?.identification,
+                    editedAt: previous?.editedAt,
+                    identifiedAt: previous?.identifiedAt
                 )
                 if let i = paintings.firstIndex(where: { $0.id == id }) {
                     paintings[i] = painting

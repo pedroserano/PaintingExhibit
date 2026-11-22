@@ -7,3 +7,7 @@ xcuserdata/
 PaintingExhibit.swiftpm/.swiftpm/xcode/xcuserdata/
 PaintingExhibit.swiftpm/.build/
 build/
+
+# Apple MobileCLIP model: fetched at build time by scripts/fetch-model.sh, not redistributed here
+PaintingExhibit.swiftpm/App/Models/*.mlmodelc
+PaintingExhibit.swiftpm/.swiftpm/

@@ -97,6 +97,8 @@ struct SettingsView: View {
 
             IdentifySettings()
 
+            ShareSettings()
+
             Section {
                 Toggle("Save edits to Photos", isOn: $library.saveEditsToPhotos)
                 if library.editedInPhotosCount > 0 {

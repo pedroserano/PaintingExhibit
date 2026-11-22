@@ -22,16 +22,19 @@ Esc closes the exhibit and returns to that painting in the gallery, pinch or dou
 
 ## iPhone and iPad: first run (free Apple account)
 
-1. Double-click `PaintingExhibit.swiftpm` to open it in Xcode.
-2. In Xcode, select the project at the top of the sidebar, open **Signing & Capabilities**,
+1. Once, fetch Apple's MobileCLIP model, which the app uses to recognise paintings (it isn't kept in this
+   repository, as Apple's licence doesn't allow redistributing it): run `scripts/fetch-model.sh`.
+   The Mac build script does this for you.
+2. Double-click `PaintingExhibit.swiftpm` to open it in Xcode.
+3. In Xcode, select the project at the top of the sidebar, open **Signing & Capabilities**,
    and set **Team** to your name (Personal Team).
    If Xcode says the bundle identifier is taken, change it to something unique.
-3. Connect your iPhone or iPad with a cable and choose it at the top of the Xcode window.
-4. On the device, turn on **Settings > Privacy & Security > Developer Mode** (it restarts).
-5. Press **Run** (⌘R).
-6. The first time, the device blocks the app: go to
+4. Connect your iPhone or iPad with a cable and choose it at the top of the Xcode window.
+5. On the device, turn on **Settings > Privacy & Security > Developer Mode** (it restarts).
+6. Press **Run** (⌘R).
+7. The first time, the device blocks the app: go to
    **Settings > General > VPN & Device Management**, tap your Apple account, and choose **Trust**.
-7. Open the app, allow Photos access, and choose your paintings album.
+8. Open the app, allow Photos access, and choose your paintings album.
 
 Every 7 days the app stops opening: connect the device and press Run again.
 Your paintings and frame choices are kept.
@@ -87,6 +90,16 @@ the service on.
 
 To be safe from charges, you can also set a budget alert in Billing, or a daily quota on the Cloud Vision API
 (APIs & Services › Cloud Vision API › Quotas).
+
+## Sharing between your devices
+
+In Settings › Share between devices, choose the same folder in iCloud Drive (for example iCloud Drive ›
+Painting Exhibit) on the Mac, iPhone and iPad. Your hand crops, white balance, frame choices and
+identifications are kept there (`edits.json`, keyed by each photo's iCloud Photos ID, which is the same on every
+device), along with the record of crop fixes and the museum data fetched for identifying, so each museum is
+fetched once for all your devices. When two devices changed the same painting, the newer change wins, and an
+identification confirmed by hand beats an automatic one. A free Apple account can't use an app's own iCloud
+storage, so the app uses a folder you choose instead.
 
 ## Non-destructive editing
 

@@ -5,6 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+scripts/fetch-model.sh
 swift build -c release --product PaintingExhibit
 BIN="$(swift build -c release --show-bin-path)"
 
@@ -13,6 +14,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp Mac/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 cp "$BIN/PaintingExhibit" "$APP/Contents/MacOS/PaintingExhibit"
+cp -R "$BIN/PaintingExhibitMac_PaintingExhibit.bundle" "$APP/Contents/Resources/"   # the model
 cp Mac/Info.plist "$APP/Contents/Info.plist"
 
 IDENTITY="${PAINTING_EXHIBIT_SIGN_IDENTITY:-$(security find-identity -v -p codesigning | awk -F'"' '/Apple Development/ {print $2; exit}')}"

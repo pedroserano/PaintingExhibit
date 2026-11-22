@@ -182,7 +182,9 @@ final class MuseumIndex: @unchecked Sendable {
         var kind: String?
     }
 
+    /// In the shared folder when one is chosen, so each museum is fetched once for all your devices.
     static var folder: URL {
+        if let shared = SharedFolder.museumsFolder { return shared }
         let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("PaintingExhibit/Museums", isDirectory: true)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
@@ -202,6 +204,9 @@ final class MuseumIndex: @unchecked Sendable {
 
     static func load(key: String) -> MuseumIndex {
         let index = MuseumIndex(key: key)
+        // In iCloud Drive the files may not be on this device yet.
+        try? FileManager.default.startDownloadingUbiquitousItem(at: index.metaURL)
+        try? FileManager.default.startDownloadingUbiquitousItem(at: index.vectorURL)
         guard let data = try? Data(contentsOf: index.metaURL),
               let meta = try? JSONDecoder().decode(Saved.self, from: data), meta.kind == Self.kind,
               let bytes = try? Data(contentsOf: index.vectorURL) else { return index }

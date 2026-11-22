@@ -11,6 +11,8 @@ let package = Package(
     platforms: [.macOS("14.0")],
     targets: [
         .executableTarget(name: "PaintingExhibit", path: "PaintingExhibit.swiftpm/App",
-                         exclude: ["Assets.xcassets"]) // the Mac icon is Mac/AppIcon.icns
+                         exclude: ["Assets.xcassets"], // the Mac icon is Mac/AppIcon.icns
+                         // Apple's MobileCLIP model, fetched by scripts/fetch-model.sh (not kept in the repository).
+                         resources: [.copy("Models/mobileclip_s0_image.mlmodelc"), .copy("Models/LICENSE-MobileCLIP.txt")])
     ]
 )
