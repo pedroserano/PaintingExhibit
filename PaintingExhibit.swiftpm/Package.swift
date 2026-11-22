@@ -40,9 +40,10 @@ let package = Package(
         .executableTarget(
             name: "App",
             path: "App",
-            // Apple's MobileCLIP model: run scripts/fetch-model.sh once before building (it isn't kept in the
-            // repository; see App/Models/LICENSE-MobileCLIP.txt).
-            resources: [.copy("Models/mobileclip_s0_image.mlmodelc"), .copy("Models/LICENSE-MobileCLIP.txt")]
+            resources: [
+                .copy("Models/mobileclip_s0_image.mlmodelc"),
+                .copy("Models/LICENSE-MobileCLIP.txt")
+            ]
         )
     ]
 )
