@@ -133,6 +133,39 @@ enum PaintingProcessor {
         return raw / luminance
     }
 
+    /// An automatic white balance from the painting's near-neutral areas (whites, greys, pale highlights): the
+    /// colours close to grey are averaged and made grey, while strongly coloured paint is ignored, so a warm or
+    /// blue painting isn't pulled to grey as a whole. A strong cast can push the whites themselves out of the
+    /// near-neutral range, so the estimate is repeated after each correction with a tighter range. `colours`
+    /// are linear light, as drawn without any hand-set balance. Nil when too little is near neutral to tell.
+    static func autoBalance(_ colours: [SIMD3<Float>]) -> ColourAdjust? {
+        var total = ColourAdjust.neutral
+        for limit: Float in [0.35, 0.3, 0.25, 0.25] {
+            let gains = colourGains(total)
+            var sum = SIMD3<Float>(repeating: 0), weight: Float = 0, neutral = 0
+            for raw in colours {
+                let c = raw * gains
+                let top = max(c.x, c.y, c.z), bottom = min(c.x, c.y, c.z)
+                let luminance = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z
+                guard luminance > 0.03, top < 0.97 else { continue }
+                let chroma = (top - bottom) / top
+                guard chroma < limit else { continue }
+                neutral += 1
+                // The more neutral and the brighter, the more it counts (pale areas show the light's colour best).
+                let w = (1 - chroma / limit) * luminance
+                sum += c / luminance * w
+                weight += w
+            }
+            guard weight > 0, Float(neutral) > Float(colours.count) * 0.02 else { return nil }
+            let step = neutralizing(sum / weight)
+            // Warmth and tint add up: each is a power of the channel gains.
+            total = ColourAdjust(warmth: max(-1, min(1, total.warmth + step.warmth)),
+                                 tint: max(-1, min(1, total.tint + step.tint)))
+            if abs(step.warmth) + abs(step.tint) < 0.01 { break }
+        }
+        return total
+    }
+
     /// The warmth and tint that make a colour (linear light, as drawn without any hand-set balance) neutral grey.
     static func neutralizing(_ c: SIMD3<Float>) -> ColourAdjust {
         let r = max(c.x, 1e-4), g = max(c.y, 1e-4), b = max(c.z, 1e-4)
@@ -419,7 +452,9 @@ enum PaintingProcessor {
         let subject = subjectFinder(baseCG)
         let document = documentQuad(in: baseCG)
         let candidates = rectangles(in: baseCG, minimumSize: 0.2, accept: plausible)
+        // A witness bent the same way (one snapped corner) proves nothing, so bent outlines don't count.
         let witnesses = [subject, candidates.first, document].compactMap { $0 }
+            .filter { unbent($0, in: size) == $0 }
         func shaped(_ found: [NormPoint]?) -> [NormPoint]? {
             guard let found else { return nil }
             // A repaired corner must leave the painting with plain wall around it, or the outline was wrong
@@ -473,6 +508,9 @@ enum PaintingProcessor {
                   squarer.allSatisfy({ $0.x > -0.02 && $0.x < 1.02 && $0.y > -0.02 && $0.y < 1.02 }) else { break }
             let movedFar = quad == wholePhoto || zip(quad, squarer).contains { hypot($0.x - $1.x, $0.y - $1.y) > 0.08 }
             if movedFar && unbent(squarer, in: size, witnesses: witnesses) != squarer { break }
+            // Squaring a detector's outline only nudges it: a corner dragged more than 15% of the photo has
+            // followed a line in the painting (hand-fixed crops measured this).
+            if quad != wholePhoto, zip(quad, squarer).contains(where: { hypot($0.x - $1.x, $0.y - $1.y) > 0.15 }) { break }
             quad = squarer
         }
         settings.paintingQuad = quad
@@ -867,10 +905,10 @@ enum PaintingProcessor {
             // The frame's edges should be clear lines, not faint ones.
             let strengths = (0..<4).compactMap { i in sides[i].first { $0.depth == depths[i] }?.score }
             guard strengths.reduce(0, +) / Float(max(1, strengths.count)) >= 0.1 else { continue }
-            // In a busy painting (foliage, a crowd) lines line up at many depths, so a frame found unusually wide
-            // must also differ in colour from the painting and from what lies inside it, on at least three sides.
-            if judgeWideFrames, (0..<4).contains(where: { Double(depths[$0]) > Double(sideReaders[$0].across) * 0.2 }),
-               (0..<4).filter({ depths[$0] > 0 && bandIsFrame(sideReaders[$0], to: depths[$0], centre: centre) }).count < 3 { continue }
+            // In a busy painting (foliage, a crowd, a patterned field) lines line up at many depths, so a frame wider
+            // than 15% must also differ in colour from the painting and from what lies inside it, on two sides or more.
+            if judgeWideFrames, (0..<4).contains(where: { Double(depths[$0]) > Double(sideReaders[$0].across) * 0.15 }),
+               (0..<4).filter({ depths[$0] > 0 && bandIsFrame(sideReaders[$0], to: depths[$0], centre: centre) }).count < 2 { continue }
             best = (width, depths)
             break
         }

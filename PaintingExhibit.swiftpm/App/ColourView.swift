@@ -17,6 +17,7 @@ struct ColourEditor: View {
     @State private var preview: CGImage?
     @State private var picking = false
     @State private var picked: CGPoint?
+    @State private var note: String?
 
     private static let context = CIContext()
 
@@ -68,6 +69,7 @@ struct ColourEditor: View {
         }
         .task(id: painting.renderedAt) { await load() }
         .onChange(of: adjust) { updatePreview() }
+        .onChange(of: picking) { note = nil }
         // Moving to another painting or leaving the mode keeps what was done.
         .onDisappear {
             if changed { Task { [library, adjust, id = painting.id] in await library.setColour(adjust, for: id) } }
@@ -87,8 +89,14 @@ struct ColourEditor: View {
                     Label(picking ? "Click a White Spot…" : "Pick White Point", systemImage: "eyedropper")
                 }
                 .help("Click a spot in the painting that should be white or neutral grey")
-                Text(picking ? "Click something that should be white or grey."
-                     : changed ? "Saved when you move on, or press Save." : "Drag the sliders, or pick a white point.")
+                Button {
+                    autoBalance()
+                } label: {
+                    Label("Auto", systemImage: "wand.and.stars")
+                }
+                .help("Make the painting's near-neutral areas (whites, greys, pale highlights) neutral")
+                Text(note ?? (picking ? "Click something that should be white or grey."
+                     : changed ? "Saved when you move on, or press Save." : "Drag the sliders, pick a white point, or try Auto."))
                     .font(.footnote)
                     .foregroundStyle(.white.opacity(0.7))
                 Spacer()
@@ -151,6 +159,35 @@ struct ColourEditor: View {
             "inputBiasVector": CIVector(x: CGFloat(bias.x), y: CGFloat(bias.y), z: CGFloat(bias.z), w: 0)
         ])
         preview = Self.context.createCGImage(image, from: image.extent)
+    }
+
+    // MARK: Auto
+
+    private func autoBalance() {
+        guard let base, !pixels.isEmpty else { return }
+        let black = painting.settings.blackPoint ?? 0, exposure = painting.settings.exposure ?? 1
+        let saved = PaintingProcessor.colourGains(painting.settings.colour)
+        var colours: [SIMD3<Float>] = []
+        let stride = max(1, (base.width * base.height) / 60_000)
+        var i = 0
+        while i < base.width * base.height {
+            let o = i * 4
+            let drawn = SIMD3(Self.linear(pixels[o]), Self.linear(pixels[o + 1]), Self.linear(pixels[o + 2]))
+            colours.append((drawn / exposure + black) / saved)
+            i += stride
+        }
+        if let found = PaintingProcessor.autoBalance(colours) {
+            adjust = found
+            picked = nil
+            note = nil
+        } else {
+            note = "Too little of this painting is white or grey to balance it automatically."
+        }
+    }
+
+    private static func linear(_ byte: UInt8) -> Float {
+        let c = Float(byte) / 255
+        return c <= 0.04045 ? c / 12.92 : powf((c + 0.055) / 1.055, 2.4)
     }
 
     // MARK: Eyedropper
