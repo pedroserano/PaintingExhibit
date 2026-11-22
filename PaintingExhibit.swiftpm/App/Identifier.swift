@@ -39,7 +39,7 @@ struct Identification: Codable, Hashable {
     /// Visual distance between the photo and the chosen work's image (lower is closer; under about 0.42
     /// is the same painting).
     var distance: Float?
-    /// How the match was found: "the caption label", "the museum's collection", "Google".
+    /// How the match was found: "the caption label", "the museum's collection", "famous paintings", "Google".
     var via: String?
     /// The museums the photo was taken in, from its location.
     var museums: [String] = []
@@ -184,13 +184,14 @@ enum Identifier {
 
     /// Looks the photo up among the paintings of the museums it was taken in: the nearest few by thumbnail
     /// fingerprint, then each checked against the work's large image.
-    static func fromMuseum(_ index: MuseumIndex, photo crop: CGImage) async -> Identification? {
+    static func fromMuseum(_ index: MuseumIndex, photo crop: CGImage,
+                           via: String = "the museum's collection") async -> Identification? {
         guard let photoPrint = await featurePrint(crop) else { return nil }
         let shortlist = await Task.detached { index.nearest(to: photoPrint, count: 4) }.value
         guard !shortlist.isEmpty else { return nil }
         let candidates = await compared(shortlist.map(\.work.candidate), with: photoPrint, mentioned: "")
         var result = Identification(status: .unidentified, searchedAt: Date())
-        result.via = "the museum's collection"
+        result.via = via
         result.candidates = candidates.filter { ($0.distance ?? 1) <= 0.25 }
         if let best = candidates.first, let d = best.distance, d <= likelyWork {
             result.status = d <= sameWork ? .matched : .possible

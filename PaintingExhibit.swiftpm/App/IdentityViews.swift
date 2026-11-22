@@ -8,6 +8,7 @@ struct IdentifySettings: View {
     var body: some View {
         Section {
             Toggle("Identify new paintings automatically", isOn: $library.identifyAutomatically)
+            Toggle("Also compare with famous paintings worldwide", isOn: $library.searchFamous)
         } header: {
             Text("Identify paintings")
         } footer: {
@@ -15,7 +16,9 @@ struct IdentifySettings: View {
             Free, with no account: the app reads caption labels in your photos, works out the museum from \
             where each photo was taken, and compares your photo with that museum's paintings from Wikidata, on \
             this device. The first photo from a museum fetches its paintings once, which can take a while for a \
-            large museum. Only names and IDs are looked up; your photos stay on the device.
+            large museum. Famous paintings worldwide (about 5,000, those with articles in at least five \
+            Wikipedias) are fetched once too, about 130 MB, so a well-known painting is recognised wherever you \
+            saw it. Only names and IDs are looked up; your photos stay on the device.
             """)
         }
 
@@ -68,12 +71,14 @@ struct DetailsPanel: View {
     @State private var lookupNote: String?
 
     private var painting: Painting? { library.paintings.first { $0.id == paintingID } }
-    private var identity: Identification? { painting?.identification }
+    /// What's known, from whichever photo of this painting knows most.
+    private var identity: Identification? { library.identity(of: paintingID) }
     private var searching: Bool { library.searching.contains(paintingID) }
 
     var body: some View {
         Form {
             statusSection
+            SamePaintingSection(paintingID: paintingID)
             if let painting { LookUpSection(painting: painting).id(painting.id) }
             nameSection
             if let identity, !identity.candidates.isEmpty { candidatesSection(identity) }

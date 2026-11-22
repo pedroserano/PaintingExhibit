@@ -14,6 +14,9 @@ struct SharedEntry: Codable {
     /// uses it instead of analysing the photo again, and only draws the image.
     var recipe: ProcessingSettings?
     var recipeVersion: Int?
+    /// Which photo is shown for its painting, and photos kept apart from look-alikes (edits, like the crop).
+    var chosen: Bool?
+    var separate: Bool?
 }
 
 /// A folder you choose (normally in iCloud Drive) that the app keeps its shareable data in, so the Mac, iPhone

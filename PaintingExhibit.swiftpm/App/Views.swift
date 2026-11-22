@@ -95,6 +95,18 @@ struct SettingsView: View {
                 Text("You can still show or remove the frame on each painting.")
             }
 
+            Section {
+                Toggle("Show each painting once", isOn: $library.hideDuplicates)
+            } header: {
+                Text("Photos of the same painting")
+            } footer: {
+                Text("""
+                When you took several photos of one painting, the gallery and exhibit show the best one (the \
+                closest, or one you edited or chose); the others are listed in its details. Identifying one \
+                photo identifies them all.
+                """)
+            }
+
             IdentifySettings()
 
             ShareSettings()
@@ -130,18 +142,28 @@ struct GalleryView: View {
     @State private var highlighted: String?
     @State private var columnCount = 1
     @State private var reviewOnly = false
+    /// The paintings the open exhibit moves through, in order.
+    @State private var exhibitList: [String] = []
+    @AppStorage("galleryGrouping") private var grouping: GalleryGrouping = .none
     @FocusState private var gridFocused: Bool
 
-    /// The paintings shown: all of them, or only possible matches waiting to be checked.
-    private var shown: [Painting] {
-        reviewOnly ? library.paintings.filter { $0.identification?.status == .possible } : library.paintings
+    /// The galleries shown: each painting once (or every photo), only possible matches when reviewing, split
+    /// by visit, museum or artist.
+    private var sections: [GallerySection] {
+        let base = library.shownPaintings
+        let filtered = reviewOnly ? base.filter { library.identity(of: $0.id)?.status == .possible } : base
+        return grouping.sections(of: filtered, library: library)
     }
+
+    /// The paintings shown, in the order shown.
+    private var shown: [Painting] { sections.flatMap(\.paintings) }
 
     private static let minimumWidth: CGFloat = 150, spacing: CGFloat = 12
     private let columns = [GridItem(.adaptive(minimum: GalleryView.minimumWidth), spacing: GalleryView.spacing)]
 
-    private func open(_ painting: Painting) {
+    private func open(_ painting: Painting, in list: [Painting]? = nil) {
         highlighted = painting.id
+        exhibitList = (list ?? shown).map(\.id)
         selected = painting
     }
 
@@ -172,10 +194,17 @@ struct GalleryView: View {
                 }
                 .padding(.horizontal)
             }
+            if library.isFingerprinting {
+                ProgressView(value: Double(library.fingerprintDone), total: Double(max(library.fingerprintTotal, 1))) {
+                    Text("Finding photos of the same painting: \(library.fingerprintDone) of \(library.fingerprintTotal)")
+                        .font(.footnote)
+                }
+                .padding(.horizontal)
+            }
             if let museum = library.indexingMuseum {
                 ProgressView(value: Double(library.indexDone), total: Double(max(library.indexTotal, 1))) {
-                    Text(library.indexTotal == 0 ? "Listing the paintings of \(museum)…"
-                         : "Fetching the paintings of \(museum) to compare with yours: \(library.indexDone) of \(library.indexTotal) (once only)")
+                    Text(library.indexTotal == 0 ? "Listing \(museum)…"
+                         : "Fetching \(museum) to compare with yours: \(library.indexDone) of \(library.indexTotal) (once only)")
                         .font(.footnote)
                 }
                 .padding(.horizontal)
@@ -198,24 +227,15 @@ struct GalleryView: View {
                                        description: Text("Add photos to the album and they'll appear here."))
                     .padding(.top, 80)
             }
-            LazyVGrid(columns: columns, spacing: Self.spacing) {
-                ForEach(shown) { painting in
-                    Button { open(painting) } label: {
-                        Thumbnail(painting: painting)
-                            .contextMenu {
-                                Button("Show in Photos", systemImage: "photo.on.rectangle") {
-                                    library.showInPhotos(painting.id)
-                                }
-                            }
-                            .overlay {
-                                if highlighted == painting.id {
-                                    RoundedRectangle(cornerRadius: 6).strokeBorder(Color.accentColor, lineWidth: 3)
-                                }
-                            }
+            LazyVGrid(columns: columns, alignment: .leading, spacing: Self.spacing) {
+                ForEach(sections) { section in
+                    Section {
+                        ForEach(section.paintings) { painting in
+                            thumbnail(painting)
+                        }
+                    } header: {
+                        if grouping != .none { sectionHeader(section) }
                     }
-                    .buttonStyle(.plain)
-                    .focusable(false)
-                    .id(painting.id)
                 }
             }
             .padding()
@@ -254,6 +274,16 @@ struct GalleryView: View {
                 .help("Show only possible matches to check")
             }
             Menu {
+                Picker("Galleries", selection: $grouping) {
+                    ForEach(GalleryGrouping.allCases) { g in
+                        Label(g.title, systemImage: g.symbol).tag(g)
+                    }
+                }
+            } label: {
+                Label("Galleries: \(grouping.title)", systemImage: grouping.symbol)
+            }
+            .help("Split the paintings into a gallery for each visit, museum or artist")
+            Menu {
                 Button("Check for new paintings", systemImage: "arrow.clockwise") {
                     Task { await library.processNew() }
                 }
@@ -290,7 +320,7 @@ struct GalleryView: View {
             }
         }
         .fullScreenCover(item: $selected) { painting in
-            ExhibitView(startID: painting.id, only: reviewOnly ? shown.map(\.id) : nil) { last in
+            ExhibitView(startID: painting.id, only: exhibitList) { last in
                 highlighted = last; selected = nil
             }
             .environmentObject(library)
@@ -298,12 +328,64 @@ struct GalleryView: View {
         #else
         .overlay {
             if let painting = selected {
-                ExhibitView(startID: painting.id, only: reviewOnly ? shown.map(\.id) : nil) { last in
+                ExhibitView(startID: painting.id, only: exhibitList) { last in
                     highlighted = last; selected = nil
                 }
             }
         }
         #endif
+    }
+
+    private func thumbnail(_ painting: Painting) -> some View {
+        Button { open(painting) } label: {
+            Thumbnail(painting: painting)
+                .overlay(alignment: .topTrailing) {
+                    let count = library.photos(of: painting.id).count
+                    if count > 1 && library.hideDuplicates {
+                        Label("\(count)", systemImage: "square.stack")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 6).padding(.vertical, 3)
+                            .background(.ultraThinMaterial, in: Capsule())
+                            .padding(6)
+                            .help("\(count) photos of this painting; the best is shown")
+                    }
+                }
+                .contextMenu {
+                    Button("Show in Photos", systemImage: "photo.on.rectangle") {
+                        library.showInPhotos(painting.id)
+                    }
+                }
+                .overlay {
+                    if highlighted == painting.id {
+                        RoundedRectangle(cornerRadius: 6).strokeBorder(Color.accentColor, lineWidth: 3)
+                    }
+                }
+        }
+        .buttonStyle(.plain)
+        .focusable(false)
+        .id(painting.id)
+    }
+
+    /// A gallery's heading, with a button to walk through just that gallery.
+    private func sectionHeader(_ section: GallerySection) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(section.title).font(.title3.weight(.semibold))
+            if let subtitle = section.subtitle {
+                Text(subtitle).font(.subheadline).foregroundStyle(.secondary)
+            }
+            Text("\(section.paintings.count)").font(.subheadline).foregroundStyle(.tertiary)
+            Spacer()
+            if let first = section.paintings.first {
+                Button { open(first, in: section.paintings) } label: {
+                    Label("View Gallery", systemImage: "play.fill")
+                }
+                .buttonStyle(.borderless)
+                .focusable(false)
+                .help("Walk through this gallery's paintings")
+            }
+        }
+        .padding(.top, 14)
+        .padding(.bottom, 2)
     }
 
     private func openHighlighted() -> KeyPress.Result {
@@ -362,7 +444,7 @@ struct ExhibitView: View {
     /// Whether the details panel is open beside the painting (remembered).
     @AppStorage("showDetails") private var showDetails = false
     @FocusState private var focused: Bool
-    /// The paintings to move through: those in `only`, in album order, or all of them.
+    /// The paintings to move through: those in `only`, in that order, or all of them.
     private let only: [String]?
     /// Closes the exhibit, passing the painting it ended on.
     let onClose: (String) -> Void
@@ -375,8 +457,8 @@ struct ExhibitView: View {
 
     private var list: [Painting] {
         guard let only else { return library.paintings }
-        let wanted = Set(only)
-        return library.paintings.filter { wanted.contains($0.id) }
+        let byID = Dictionary(library.paintings.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        return only.compactMap { byID[$0] }
     }
 
     private func close() { onClose(current) }
@@ -485,7 +567,8 @@ struct ExhibitView: View {
                 .contextMenu { paintingMenu }
             if showLabel, let painting = currentPainting {
                 Divider()
-                CaptionBar(painting: painting, keepsFrame: library.keepsFrame(painting))
+                CaptionBar(painting: painting, identity: library.identity(of: painting.id),
+                           keepsFrame: library.keepsFrame(painting))
             }
         }
     }
@@ -659,7 +742,8 @@ struct PaintingPage: View {
 
             #if os(iOS)
             if showLabel && !zoomed {
-                WallLabel(painting: painting, keepsFrame: library.keepsFrame(painting))
+                WallLabel(painting: painting, identity: library.identity(of: painting.id),
+                          keepsFrame: library.keepsFrame(painting))
                     .padding(.bottom, 32)
                     .transition(.opacity)
             }
@@ -677,9 +761,10 @@ struct PaintingPage: View {
 /// processing did.
 struct CaptionText {
     let painting: Painting
+    /// What's known about the painting, from whichever of its photos knows most.
+    let identity: Identification?
     let keepsFrame: Bool
 
-    private var identity: Identification? { painting.identification }
     var isIdentified: Bool { identity?.isIdentified == true && identity?.title != nil }
     var title: String {
         if isIdentified, let title = identity?.title { return title }
@@ -727,10 +812,11 @@ struct CaptionText {
 /// A museum-style wall label over the painting, on iPhone and iPad (tap the painting to hide it).
 struct WallLabel: View {
     let painting: Painting
+    let identity: Identification?
     let keepsFrame: Bool
 
     var body: some View {
-        let text = CaptionText(painting: painting, keepsFrame: keepsFrame)
+        let text = CaptionText(painting: painting, identity: identity, keepsFrame: keepsFrame)
         VStack(alignment: .leading, spacing: 4) {
             Text(text.title)
                 .font(.system(.headline, design: .serif))
@@ -753,10 +839,11 @@ struct WallLabel: View {
 /// The caption on the Mac: a bar below the painting in the system's style, never covering it.
 struct CaptionBar: View {
     let painting: Painting
+    let identity: Identification?
     let keepsFrame: Bool
 
     var body: some View {
-        let text = CaptionText(painting: painting, keepsFrame: keepsFrame)
+        let text = CaptionText(painting: painting, identity: identity, keepsFrame: keepsFrame)
         HStack(alignment: .center, spacing: 16) {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {

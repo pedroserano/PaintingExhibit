@@ -27,6 +27,10 @@ struct Painting: Codable, Identifiable, Hashable {
     /// changed, for sharing between devices (the newer wins).
     var editedAt: Date?
     var identifiedAt: Date?
+    /// The photo you chose to show for its painting, when there are several photos of it.
+    var chosen: Bool?
+    /// Never grouped with look-alikes: you said it's a different painting.
+    var separate: Bool?
 }
 
 /// One crop fixed by hand: what the app chose and what the person chose instead. Kept as a record to
@@ -104,12 +108,19 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
             if identifyAutomatically && !oldValue { Task { await identifyPending() } }
         }
     }
+    /// Whether paintings are also compared with the famous paintings worldwide (fetched once, about 130 MB).
+    @Published var searchFamous: Bool {
+        didSet {
+            UserDefaults.standard.set(searchFamous, forKey: "searchFamous")
+            if searchFamous && !oldValue { Task { await identifyPending(force: true) } }
+        }
+    }
     @Published private(set) var isIdentifying = false
     @Published private(set) var identifyDone = 0
     @Published private(set) var identifyTotal = 0
     /// Paintings being looked up right now, one at a time.
     @Published private(set) var searching: Set<String> = []
-    /// The museum whose paintings are being fetched for searching, with progress.
+    /// What is being fetched for searching ("the paintings of …", "the famous paintings worldwide"), with progress.
     @Published private(set) var indexingMuseum: String?
     @Published private(set) var indexDone = 0
     @Published private(set) var indexTotal = 0
@@ -124,10 +135,11 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     }
     var lookupsThisMonth: Int { UserDefaults.standard.integer(forKey: Self.monthKey) }
     var lookupsLeft: Int { max(0, Self.monthlyLookupLimit - lookupsThisMonth) }
-    var toReviewCount: Int { paintings.filter { $0.identification?.status == .possible }.count }
+    var toReviewCount: Int { shownPaintings.filter { identity(of: $0.id)?.status == .possible }.count }
 
     let cacheFolder: URL
     private let indexURL: URL
+    private let printsURL: URL
     private var albumFetch: PHFetchResult<PHAsset>?
     private var stale: Set<String> = []          // photos edited elsewhere since they were analysed
     /// Every crop fixed by hand, one JSON record per line (in the app's Application Support folder), for
@@ -156,6 +168,9 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         _keepFramesByDefault = Published(initialValue: defaults.bool(forKey: "keepFramesByDefault"))
         _saveEditsToPhotos = Published(initialValue: defaults.bool(forKey: "saveEditsToPhotos"))
         _identifyAutomatically = Published(initialValue: defaults.object(forKey: "identifyAutomatically") as? Bool ?? true)
+        _searchFamous = Published(initialValue: defaults.object(forKey: "searchFamous") as? Bool ?? true)
+        _hideDuplicates = Published(initialValue: defaults.object(forKey: "hideDuplicates") as? Bool ?? true)
+        printsURL = support.appendingPathComponent("fingerprints.json")
         super.init()
 
         #if os(iOS)
@@ -167,6 +182,8 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         }
         #endif
         load()
+        loadPrints()
+        regroup()
     }
 
     // MARK: Access and albums
@@ -349,7 +366,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                 shared = (try? decoder.decode([String: SharedEntry].self, from: data)) ?? [:]
             }
             let ids = cloudID(paintings.map(\.id))
-            var changedShared = false, redraw = false
+            var changedShared = false, redraw = false, regroupNeeded = false
             for i in paintings.indices {
                 guard let key = ids[paintings[i].id] else { continue }
                 var entry = shared[key] ?? SharedEntry()
@@ -358,6 +375,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                 // Edits: the newer side wins. Edits made before sharing existed carry no time; they still count
                 // as newer than nothing shared.
                 let hasEdits = p.manualCrop != nil || p.settings.colour != nil || p.keepFrame != nil
+                    || p.chosen != nil || p.separate != nil
                 if p.editedAt == nil, hasEdits {
                     paintings[i].editedAt = p.renderedAt
                 }
@@ -374,11 +392,18 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                         paintings[i].keepFrame = entry.keepFrame
                         redraw = true
                     }
+                    if entry.chosen != p.chosen || entry.separate != p.separate {
+                        paintings[i].chosen = entry.chosen
+                        paintings[i].separate = entry.separate
+                        regroupNeeded = true
+                    }
                     paintings[i].editedAt = entry.editedAt
                 } else if mine > theirs {
                     entry.manualCrop = p.manualCrop
                     entry.colour = p.settings.colour
                     entry.keepFrame = p.keepFrame
+                    entry.chosen = p.chosen
+                    entry.separate = p.separate
                     entry.editedAt = paintings[i].editedAt
                     changedShared = true
                 }
@@ -428,7 +453,200 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                 }
             }
             if redraw { Task { await processNew() } }
+            if regroupNeeded { regroup() }
         } while syncAgain
+    }
+
+
+    // MARK: Photos of the same painting
+
+    /// Two photos whose fingerprints are this close show the same painting. Measured on the album: every pair up
+    /// to 0.064 was the same painting, photographed from another spot or in other light, and the first different
+    /// paintings (two versions of a Monet, portraits by one painter) came at 0.068; this leaves a margin.
+    nonisolated static let samePhotoDistance: Float = 0.055
+
+    /// Whether each painting is shown once (its best photo) in the gallery and exhibit, instead of every photo.
+    @Published var hideDuplicates: Bool {
+        didSet { UserDefaults.standard.set(hideDuplicates, forKey: "hideDuplicates") }
+    }
+    /// For each photo in a group of photos of one painting: the group, the photo shown first.
+    @Published private(set) var groups: [String: [String]] = [:]
+    @Published private(set) var fingerprintDone = 0
+    @Published private(set) var fingerprintTotal = 0
+    @Published private(set) var isFingerprinting = false
+
+    private struct Print: Codable {
+        var renderedAt: Date
+        var vector: [Float]
+    }
+    /// Each painting's MobileCLIP fingerprint, from its drawn image (redone when it's drawn again).
+    private var prints: [String: Print] = [:]
+
+    private func loadPrints() {
+        guard let data = try? Data(contentsOf: printsURL),
+              let saved = try? JSONDecoder().decode([String: Print].self, from: data) else { return }
+        prints = saved
+    }
+
+    private func savePrints() {
+        let snapshot = prints, url = printsURL
+        Task.detached(priority: .utility) {
+            if let data = try? JSONEncoder().encode(snapshot) { try? data.write(to: url, options: .atomic) }
+        }
+    }
+
+    /// Takes the fingerprint of every painting drawn since it was last taken, then regroups.
+    func fingerprintPending() async {
+        guard !isFingerprinting else { return }
+        let todo = paintings.filter { prints[$0.id]?.renderedAt != $0.renderedAt }
+        prints = prints.filter { id, _ in paintings.contains { $0.id == id } }
+        guard !todo.isEmpty else { regroup(); return }
+        isFingerprinting = true
+        fingerprintDone = 0
+        fingerprintTotal = todo.count
+        defer { isFingerprinting = false }
+        for painting in todo {
+            if let url = await imageURL(for: painting),
+               let image = await Task.detached(priority: .utility, operation: { Identifier.loadImage(url, maxPixel: 1024) }).value,
+               let vector = await Identifier.featurePrint(image) {
+                prints[painting.id] = Print(renderedAt: painting.renderedAt, vector: vector)
+            }
+            fingerprintDone += 1
+            if fingerprintDone % 50 == 0 { savePrints(); regroup() }
+        }
+        savePrints()
+        regroup()
+    }
+
+    /// Groups photos of the same painting: fingerprints that close, or the same work identified in both. Photos
+    /// you kept apart never join a group, and two works confirmed as different never share one.
+    func regroup() {
+        let ids = paintings.map(\.id)
+        let byID = Dictionary(paintings.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        var parent = Dictionary(uniqueKeysWithValues: ids.map { ($0, $0) })
+        func root(_ id: String) -> String {
+            var r = id
+            while let p = parent[r], p != r { r = p }
+            var c = id
+            while let p = parent[c], p != r { parent[c] = r; c = p }
+            return r
+        }
+        // The works confirmed by hand in each group, so two different confirmed works are never joined.
+        var confirmed: [String: Set<String>] = [:]
+        for p in paintings {
+            if let i = p.identification, i.status == .confirmed { confirmed[p.id] = [i.wikidata ?? i.title ?? ""] }
+        }
+        func join(_ a: String, _ b: String) {
+            let ra = root(a), rb = root(b)
+            guard ra != rb else { return }
+            let ca = confirmed[ra] ?? [], cb = confirmed[rb] ?? []
+            guard ca.isEmpty || cb.isEmpty || ca == cb else { return }
+            parent[rb] = ra
+            confirmed[ra] = ca.union(cb)
+        }
+        let candidates = paintings.filter { $0.separate != true }
+        // The same work, confirmed in both (automatic matches can be wrong, so they don't join photos).
+        var byWork: [String: String] = [:]
+        for p in candidates {
+            guard let i = p.identification, i.status == .confirmed, let q = i.wikidata else { continue }
+            if let other = byWork[q] { join(other, p.id) } else { byWork[q] = p.id }
+        }
+        // Look-alikes.
+        let printed = candidates.compactMap { p in prints[p.id].map { (p.id, $0.vector) } }
+        for a in printed.indices {
+            let (idA, va) = printed[a]
+            for b in printed.indices where b > a {
+                let (idB, vb) = printed[b]
+                guard va.count == vb.count else { continue }
+                var dot: Float = 0
+                for k in va.indices { dot += va[k] * vb[k] }
+                if 1 - dot <= Self.samePhotoDistance { join(idA, idB) }
+            }
+        }
+        var members: [String: [String]] = [:]
+        for id in ids { members[root(id), default: []].append(id) }
+        var result: [String: [String]] = [:]
+        for group in members.values where group.count > 1 {
+            let ordered = group.sorted { a, b in
+                (byID[a].map(photoScore) ?? 0) > (byID[b].map(photoScore) ?? 0)
+            }
+            for id in group { result[id] = ordered }
+        }
+        if result != groups { groups = result }
+    }
+
+    /// Which photo of a painting to show: the one you chose, then one you worked on by hand, then the one in
+    /// which the painting fills most of the photo (closest, most detail).
+    private func photoScore(_ p: Painting) -> Double {
+        if p.chosen == true { return 100 }
+        let quad = p.manualCrop?.quad ?? p.settings.paintingQuad
+        var area = 0.35
+        if let q = quad, q.count == 4 {
+            var twice = 0.0
+            for i in 0..<4 {
+                let a = q[i], b = q[(i + 1) % 4]
+                twice += Double(a.x * b.y - b.x * a.y)
+            }
+            area = abs(twice) / 2
+        }
+        let worked = p.manualCrop != nil || p.settings.colour != nil ? 0.5 : 0
+        return area + worked
+    }
+
+    /// All the photos of this painting (just this one when there are no others), the one shown first.
+    func photos(of id: String) -> [String] { groups[id] ?? [id] }
+
+    /// The paintings to show: each painting once (its best photo) when duplicates are hidden, in album order.
+    var shownPaintings: [Painting] {
+        guard hideDuplicates else { return paintings }
+        return paintings.filter { p in groups[p.id]?.first.map { $0 == p.id } ?? true }
+    }
+
+    /// What's known about which painting a photo shows, from the best-placed of its group: confirmed by you,
+    /// then the closest match, then a possible match.
+    func identity(of id: String) -> Identification? {
+        let own = paintings.first { $0.id == id }?.identification
+        guard let group = groups[id] else { return own }
+        func rank(_ i: Identification) -> (Int, Float) {
+            switch i.status {
+            case .confirmed: return (0, 0)
+            case .matched: return (1, i.distance ?? 0.5)
+            case .possible: return (2, i.distance ?? 0.5)
+            case .unidentified: return (3, 1)
+            }
+        }
+        let all = group.compactMap { g in paintings.first { $0.id == g }?.identification }
+        return all.min { rank($0) < rank($1) } ?? own
+    }
+
+    /// Shows this photo for its painting, instead of the one chosen automatically.
+    func choosePhoto(_ id: String) {
+        for member in photos(of: id) {
+            guard let i = paintings.firstIndex(where: { $0.id == member }) else { continue }
+            let want: Bool? = member == id ? true : nil
+            if paintings[i].chosen != want {
+                paintings[i].chosen = want
+                edited(member)
+            }
+        }
+        regroup()
+    }
+
+    /// Keeps this photo apart from the photos it was grouped with: it shows a different painting.
+    func separatePhoto(_ id: String) {
+        guard let i = paintings.firstIndex(where: { $0.id == id }) else { return }
+        paintings[i].separate = true
+        paintings[i].chosen = nil
+        edited(id)
+        regroup()
+    }
+
+    /// Lets this photo be grouped with its look-alikes again.
+    func joinLookAlikes(_ id: String) {
+        guard let i = paintings.firstIndex(where: { $0.id == id }) else { return }
+        paintings[i].separate = nil
+        edited(id)
+        regroup()
     }
 
     // MARK: Showing the original
@@ -568,6 +786,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         } while anotherPass
         isProcessing = false
         await syncShared()
+        await fingerprintPending()
         await identifyPending()
     }
 
@@ -611,9 +830,11 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     }
 
     /// Bump when the search improves, so paintings it couldn't place are tried again.
-    static let searchVersion = 3
+    static let searchVersion = 4
 
     private func needsSearch(_ p: Painting) -> Bool {
+        // Another photo of the painting already settled it.
+        if groups[p.id] != nil, let known = identity(of: p.id), known.status == .confirmed || known.status == .matched { return false }
         guard let id = p.identification else { return true }
         return id.status == .unidentified && (id.searchVersion ?? 1) < Self.searchVersion
     }
@@ -645,7 +866,14 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
             }
         }
 
-        // 3. Google, when a key is saved, as the last resort.
+        // 3. The famous paintings worldwide: for photos with no location, or taken where the museum search
+        // doesn't reach.
+        if !settled(), searchFamous, let index = await famousIndex(),
+           let found = await Identifier.fromMuseum(index, photo: crop, via: "famous paintings worldwide") {
+            results.append(found)
+        }
+
+        // 4. Google, when a key is saved, as the last resort.
         var googleError: Error?
         if !settled(), useGoogle, let key = APIKeyStore.load(), lookupsLeft > 0 {
             UserDefaults.standard.set(lookupsThisMonth + 1, forKey: Self.monthKey)
@@ -735,10 +963,31 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         let index = museumIndexes[museum.q] ?? MuseumIndex.load(key: museum.q)
         museumIndexes[museum.q] = index
         if !index.isComplete, museumsFetched.insert(museum.q).inserted {
-            indexingMuseum = museum.name
+            indexingMuseum = "the paintings of \(museum.name)"
             indexDone = 0
             indexTotal = 0
             await index.build(for: [museum]) { done, total in
+                await MainActor.run {
+                    self.indexDone = done
+                    self.indexTotal = total
+                }
+            }
+            indexingMuseum = nil
+        }
+        return index.works.isEmpty ? nil : index
+    }
+
+    /// The famous paintings worldwide, ready to search; fetched the first time (once for all your devices when
+    /// a shared folder is chosen), with progress shown.
+    private func famousIndex() async -> MuseumIndex? {
+        let key = MuseumIndex.famousKey
+        let index = museumIndexes[key] ?? MuseumIndex.load(key: key)
+        museumIndexes[key] = index
+        if !index.isComplete, museumsFetched.insert(key).inserted {
+            indexingMuseum = "the famous paintings worldwide"
+            indexDone = 0
+            indexTotal = 0
+            await index.build(listing: { await MuseumIndex.listFamousWorks() }) { done, total in
                 await MainActor.run {
                     self.indexDone = done
                     self.indexTotal = total
@@ -765,7 +1014,8 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         let previous = paintings[i].identification
         found.museums = previous?.museums ?? []
         found.searchVersion = Self.searchVersion
-        if found.status == .matched {
+        let matched = found.status == .matched
+        if matched {
             found.status = .confirmed
             paintings[i].identification = found
         } else {
@@ -775,8 +1025,27 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
             paintings[i].identification = kept
         }
         save()
+        if matched { shareIdentity(from: id) }
         identified(id)
-        return found.status == .matched
+        return matched
+    }
+
+    /// Gives what you decided about one photo's painting to the other photos of it, so a painting is identified
+    /// once however many photos you took of it.
+    private func shareIdentity(from id: String) {
+        guard let group = groups[id], let source = paintings.first(where: { $0.id == id })?.identification else { return }
+        let now = Date()
+        for member in group where member != id {
+            guard let i = paintings.firstIndex(where: { $0.id == member }) else { continue }
+            var copy = source
+            if let own = paintings[i].identification {
+                copy.museums = own.museums.isEmpty ? source.museums : own.museums
+                copy.candidates = source.candidates + own.candidates.filter { c in !source.candidates.contains { $0.id == c.id } }
+            }
+            paintings[i].identification = copy
+            paintings[i].identifiedAt = now
+        }
+        regroup()
     }
 
     /// Takes one of the candidates as the painting, confirmed.
@@ -787,6 +1056,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         identity.status = .confirmed
         paintings[i].identification = identity
         save()
+        shareIdentity(from: id)
         identified(id)
     }
 
@@ -808,6 +1078,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         identity.status = typed.0 == nil ? .unidentified : .confirmed
         paintings[i].identification = identity
         save()
+        shareIdentity(from: id)
         identified(id)
     }
 
@@ -816,6 +1087,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         guard let i = paintings.firstIndex(where: { $0.id == id }), paintings[i].identification?.title != nil else { return }
         paintings[i].identification?.status = .confirmed
         save()
+        shareIdentity(from: id)
         identified(id)
     }
 
@@ -830,6 +1102,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         identity.distance = nil
         paintings[i].identification = identity
         save()
+        shareIdentity(from: id)
         identified(id)
     }
 
@@ -937,7 +1210,9 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                     photoText: previous?.photoText,
                     identification: previous?.identification ?? adopted?.identification,
                     editedAt: adopted != nil ? (adopted?.editedAt ?? previous?.editedAt) : previous?.editedAt,
-                    identifiedAt: previous?.identification != nil ? previous?.identifiedAt : adopted?.identifiedAt
+                    identifiedAt: previous?.identification != nil ? previous?.identifiedAt : adopted?.identifiedAt,
+                    chosen: adopted != nil ? adopted?.chosen : previous?.chosen,
+                    separate: adopted != nil ? adopted?.separate : previous?.separate
                 )
                 if let i = paintings.firstIndex(where: { $0.id == id }) {
                     paintings[i] = painting

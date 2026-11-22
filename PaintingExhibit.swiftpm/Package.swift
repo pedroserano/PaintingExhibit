@@ -42,7 +42,8 @@ let package = Package(
             path: "App",
             resources: [
                 .copy("Models/mobileclip_s0_image.mlmodelc"),
-                .copy("Models/LICENSE-MobileCLIP.txt")
+                .copy("Models/LICENSE-MobileCLIP.txt"),
+                .copy("Models/famous-paintings.json")
             ]
         )
     ]

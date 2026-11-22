@@ -26,7 +26,7 @@ struct IndexedWork: Codable, Hashable {
 }
 
 /// A searchable copy of the paintings in the museums where a photo was taken: each painting's image
-/// fingerprint (Apple's Vision feature print of a small thumbnail), kept on the device. Built once per museum
+/// fingerprint (MobileCLIP, from a small thumbnail), kept on the device. Built once per museum
 /// from Wikidata and Wikimedia Commons, both free and open, and reused for every photo taken there.
 final class MuseumIndex: @unchecked Sendable {
     let key: String
@@ -79,7 +79,12 @@ final class MuseumIndex: @unchecked Sendable {
     /// Lists the museums' paintings (once) and fingerprints those not done yet, reporting progress as it
     /// goes and saving every so often, so an interrupted build picks up where it stopped.
     func build(for museums: [Museum], progress: @escaping @Sendable (Int, Int) async -> Void) async {
-        if listedAt == nil || !isComplete, let fresh = await Self.listWorks(in: museums) {
+        await build(listing: { await Self.listWorks(in: museums) }, progress: progress)
+    }
+
+    /// Builds the index from any list of paintings (a museum's, or the famous paintings worldwide).
+    func build(listing: () async -> [IndexedWork]?, progress: @escaping @Sendable (Int, Int) async -> Void) async {
+        if listedAt == nil || !isComplete, let fresh = await listing() {
             listed = fresh
             listedAt = Date()
         }
@@ -158,6 +163,22 @@ final class MuseumIndex: @unchecked Sendable {
             }
             """
         guard let rows = await Identifier.sparql(query, timeout: 120) else { return nil }
+        return works(from: rows)
+    }
+
+    /// The famous paintings worldwide: those with an image and articles in at least five Wikipedias (about
+    /// 5,000), whichever museum holds them. Lets a well-known painting be recognised even when the photo has no
+    /// location, or was taken somewhere the museum search doesn't reach (a loan, a travelling exhibition).
+    /// The list is built into the app (scripts/make-famous-list.py), as Wikidata often can't run the query in
+    /// time; only the thumbnails are fetched.
+    static let famousKey = "famous-paintings"
+    static func listFamousWorks() async -> [IndexedWork]? {
+        guard let url = Bundle.module.url(forResource: "famous-paintings", withExtension: "json"),
+              let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode([IndexedWork].self, from: data)
+    }
+
+    private static func works(from rows: [[String: String]]) -> [IndexedWork] {
         var seen = Set<String>()
         var works: [IndexedWork] = []
         for row in rows {
