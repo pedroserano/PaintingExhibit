@@ -513,9 +513,7 @@ struct WallLabel: View {
         } else if s.cropFound {
             parts.append("no frame found")
         }
-        if s.cropFound {
-            parts.append("light colour corrected \(Int((s.lightStrength * 100).rounded()))%")
-        }
+        if s.colourMatch != nil { parts.append("colour matched to its other photos") }
         if s.unevenLightFixed { parts.append("spotlight evened") }
         if painting.photosRecipe != nil { parts.append("saved to Photos") }
         if keepsFrame != s.keptFrame && painting.manualCrop == nil { parts.append("updating…") }

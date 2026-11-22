@@ -45,9 +45,12 @@ Your paintings and frame choices are kept.
   straight; iPhone photos usually need none, as the camera removes it.
   **Show frames** in Settings sets the default; **Show frame / Remove frame** on a painting overrides it.
 - Samples the wall on all four sides of the frame:
-  - its colour sets the white balance (skipped when the wall itself is clearly coloured, e.g. a red gallery);
+  - its colour isn't used for white balance: the patch of wall beside the crop varies from photo to photo,
+    and it made photos of the same painting differ more than the cameras did;
   - the difference between sides evens out spotlight falloff across the canvas.
 - Gently sets exposure from the painting's own brightness range.
+- Recognises photos of the same painting (Apple's on-device image similarity) and matches their colours to
+  the group's typical colour, so a painting photographed twice looks the same both times.
 - Each caption shows what was done (for tuning). Identification comes in phase 2.
 - Picks up photos added to (or edited in) the album on its own, while open or on returning to the app.
 - **Adjust Crop** on any painting shows the photo with the crop's four corners; drag them onto the painting's
