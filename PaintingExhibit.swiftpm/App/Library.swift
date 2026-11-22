@@ -207,14 +207,9 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
             for asset in details.changedObjects where change.changeDetails(for: asset)?.assetContentChanged == true {
                 let id = asset.localIdentifier
                 if let at = ownWrites[id], Date().timeIntervalSince(at) < 120 { continue }
-                // Edited elsewhere (cropped, rotated, reverted in Photos): analyse it again.
-                stale.insert(id)
-                // If it carried this app's edit, someone else has taken over: don't save over their change.
-                if let i = paintings.firstIndex(where: { $0.id == id }), paintings[i].photosRecipe != nil {
-                    paintings[i].photosRecipe = nil
-                    paintings[i].photosLeftAlone = true
-                    save()
-                }
+                // Edited elsewhere (cropped, rotated, reverted in Photos, or by this app on another of your
+                // devices): analyse it again. Whose edit it now carries is checked before saving to Photos.
+                redrawLater(id)
             }
         }
         // Wait a moment so a batch of additions is handled in one go.
@@ -223,6 +218,16 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
             try? await Task.sleep(for: .seconds(1))
             guard !Task.isCancelled else { return }
             await processNew()
+        }
+    }
+
+    /// Marks a painting to be drawn again, kept with the painting so it still happens after a restart (a crash
+    /// or quitting before the redraw finished would otherwise leave the old picture with the new edit).
+    private func redrawLater(_ id: String) {
+        stale.insert(id)
+        if let i = paintings.firstIndex(where: { $0.id == id }) {
+            paintings[i].version = 0
+            save()
         }
     }
 
@@ -334,6 +339,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                     if entry.manualCrop != p.manualCrop || entry.colour != p.settings.colour {
                         paintings[i].manualCrop = entry.manualCrop
                         paintings[i].settings.colour = entry.colour
+                        paintings[i].version = 0          // redraw, even after a restart
                         stale.insert(p.id)
                         redraw = true
                     }
@@ -429,7 +435,13 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
             edited(id)
             if saveEditsToPhotos { await processNew() }
         } catch {
-            lastError = "The painting couldn't be redrawn: \(error.localizedDescription)"
+            // Keep the setting and draw it on the next pass (also after a restart).
+            if let j = paintings.firstIndex(where: { $0.id == id }) {
+                paintings[j].settings.colour = settings.colour
+                edited(id)
+                redrawLater(id)
+            }
+            lastError = "The painting couldn't be redrawn yet: \(error.localizedDescription). It will be tried again."
         }
     }
 
@@ -475,8 +487,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
             }
         }
         paintings[i].manualCrop = quad.map { ManualCrop(quad: $0, lensK: lensK) }
-        stale.insert(id)
-        save()
+        redrawLater(id)
         edited(id)
         Task { await processNew() }
     }
@@ -503,6 +514,8 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
             let all = forceAll
             forceAll = false
             await runPass(reprocessAll: all)
+            // Take in your other devices' changes before saving to Photos, so an older edit never overwrites a newer one.
+            await syncShared()
             await writeEditsToPhotos()
         } while anotherPass
         isProcessing = false
@@ -877,8 +890,10 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     /// All edits in a pass are saved in one change, so the system asks for permission once.
     private func writeEditsToPhotos() async {
         guard saveEditsToPhotos else { return }
+        // Not paintings waiting to be drawn again: their recipe is about to change.
         let todo = paintings.filter { p in
-            p.photosLeftAlone != true && !(p.photosRecipe.map { $0.looksSame(as: p.settings) } ?? false)
+            p.photosLeftAlone != true && p.version == Self.processingVersion && !stale.contains(p.id)
+                && !(p.photosRecipe.map { $0.looksSame(as: p.settings) } ?? false)
         }
         guard !todo.isEmpty else { return }
         progressDone = 0
