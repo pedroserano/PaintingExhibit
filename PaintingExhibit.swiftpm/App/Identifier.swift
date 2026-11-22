@@ -43,6 +43,8 @@ struct Identification: Codable, Hashable {
     var via: String?
     /// The museums the photo was taken in, from its location.
     var museums: [String] = []
+    /// Which version of the search found this; older unconfirmed results are searched again.
+    var searchVersion: Int?
 
     var isIdentified: Bool { title != nil && status != .unidentified }
 }

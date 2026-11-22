@@ -24,6 +24,8 @@
 	<string>public.app-category.photography</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Painting Exhibit asks Photos to show a painting's original photo when you choose Show in Photos.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Painting Exhibit reads the paintings album you choose so it can crop, correct and display each painting. It changes photos only if you turn on Save Edits to Photos, and Photos keeps the originals.</string>
 	<key>NSPrincipalClass</key>

@@ -234,6 +234,29 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         Task { await processNew() }
     }
 
+    // MARK: Showing the original
+
+    /// Opens Photos at the painting's original photo (on iPhone and iPad, which can't open one photo from
+    /// another app, it just opens Photos).
+    func showInPhotos(_ id: String) {
+        #if os(macOS)
+        let escaped = id.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        let source = """
+            tell application "Photos"
+                activate
+                spotlight media item id "\(escaped)"
+            end tell
+            """
+        var error: NSDictionary?
+        NSAppleScript(source: source)?.executeAndReturnError(&error)
+        if let error {
+            lastError = "Photos couldn't show the photo: \(error[NSAppleScript.errorMessage] as? String ?? "permission may be needed in System Settings › Privacy & Security › Automation")."
+        }
+        #else
+        if let url = URL(string: "photos-redirect://") { UIApplication.shared.open(url) }
+        #endif
+    }
+
     // MARK: White balance by hand
 
     @Published private(set) var recolouring: Set<String> = []
@@ -352,8 +375,9 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     /// a time. Free sources come first (the caption label, the museum's collection); Google only with a key.
     func identifyPending(force: Bool = false) async {
         guard identifyAutomatically || force, !isIdentifying else { return }
-        // Paintings photographed close together first, so each museum's paintings are fetched once.
-        let pending = paintings.filter { $0.identification == nil }
+        // Paintings photographed close together first, so each museum's paintings are fetched once. Paintings
+        // the search gave up on are searched again when it improves; matches confirmed by hand never are.
+        let pending = paintings.filter { needsSearch($0) }
             .sorted { ($0.takenAt ?? .distantPast) < ($1.takenAt ?? .distantPast) }
             .map(\.id)
         guard !pending.isEmpty else { return }
@@ -362,7 +386,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         identifyTotal = pending.count
         defer { isIdentifying = false; indexingMuseum = nil }
         for id in pending {
-            guard paintings.contains(where: { $0.id == id && $0.identification == nil }) else { continue }
+            guard let p = paintings.first(where: { $0.id == id }), needsSearch(p) else { continue }
             do {
                 try await identify(id, useGoogle: true)
             } catch IdentifyError.google(let message) {
@@ -373,6 +397,14 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
             }
             identifyDone += 1
         }
+    }
+
+    /// Bump when the search improves, so paintings it couldn't place are tried again.
+    static let searchVersion = 2
+
+    private func needsSearch(_ p: Painting) -> Bool {
+        guard let id = p.identification else { return true }
+        return id.status == .unidentified && (id.searchVersion ?? 1) < Self.searchVersion
     }
 
     /// Searches for one painting and stores what was found: first its caption label, then the collections of
@@ -411,6 +443,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
 
         var found = Self.combine(results)
         found.museums = museums.map(\.name)
+        found.searchVersion = Self.searchVersion
         guard let i = paintings.firstIndex(where: { $0.id == id }) else { return }
         if var kept = paintings[i].identification, kept.status == .confirmed {
             kept.candidates = found.candidates

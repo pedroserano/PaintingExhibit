@@ -195,6 +195,11 @@ struct GalleryView: View {
                 ForEach(shown) { painting in
                     Button { open(painting) } label: {
                         Thumbnail(painting: painting)
+                            .contextMenu {
+                                Button("Show in Photos", systemImage: "photo.on.rectangle") {
+                                    library.showInPhotos(painting.id)
+                                }
+                            }
                             .overlay {
                                 if highlighted == painting.id {
                                     RoundedRectangle(cornerRadius: 6).strokeBorder(Color.accentColor, lineWidth: 3)
@@ -424,6 +429,21 @@ struct ExhibitView: View {
         }
     }
 
+    /// The painting's right-click (or long-press) menu.
+    @ViewBuilder private var paintingMenu: some View {
+        if let painting = currentPainting {
+            Button("Show in Photos", systemImage: "photo.on.rectangle") { library.showInPhotos(painting.id) }
+            Divider()
+            Button(mode == .crop ? "Stop Adjusting Crop" : "Adjust Crop", systemImage: "crop.rotate") {
+                mode = mode == .crop ? .view : .crop
+            }
+            Button(mode == .colour ? "Stop White Balance" : "White Balance", systemImage: "eyedropper.halffull") {
+                mode = mode == .colour ? .view : .colour
+            }
+            Button(showDetails ? "Hide Details" : "Show Details", systemImage: "sidebar.right") { showDetails.toggle() }
+        }
+    }
+
     /// Previous and next, at the sides.
     private var stepButtons: some View {
         HStack {
@@ -453,6 +473,7 @@ struct ExhibitView: View {
             mainArea
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color.black)
+                .contextMenu { paintingMenu }
             if showLabel, let painting = currentPainting {
                 Divider()
                 CaptionBar(painting: painting, keepsFrame: library.keepsFrame(painting))
@@ -464,6 +485,7 @@ struct ExhibitView: View {
         ZStack(alignment: .top) {
             Color.black.ignoresSafeArea()
             mainArea
+                .contextMenu { paintingMenu }
             if showLabel || mode != .view {
                 controls.transition(.opacity)
             }

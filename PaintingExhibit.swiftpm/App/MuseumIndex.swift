@@ -221,20 +221,21 @@ private extension URLSessionConfiguration {
 
 /// Works out which museums a photo was taken in from its location, using Wikidata's places.
 enum MuseumFinder {
-    /// Museums (and their buildings and galleries) within 400 m, nearest first. Nearby places that are parts of
-    /// a museum (a wing, a gallery) are kept, as paintings are recorded against either.
+    /// The places within 1.5 km that have paintings in Wikidata (in their collection or at their location),
+    /// nearest first: museums, and their buildings and galleries. Indoor locations are often a few hundred
+    /// metres out, and a large museum's recorded point can be far from the gallery you were in.
     static func museums(near latitude: Double, _ longitude: Double) async -> [Museum] {
         let query = """
             SELECT ?m ?mLabel ?dist WHERE {
               SERVICE wikibase:around {
                 ?m wdt:P625 ?loc .
                 bd:serviceParam wikibase:center "Point(\(longitude) \(latitude))"^^geo:wktLiteral .
-                bd:serviceParam wikibase:radius "0.4" .
+                bd:serviceParam wikibase:radius "1.5" .
                 bd:serviceParam wikibase:distance ?dist .
               }
-              ?m wdt:P31/wdt:P279* wd:Q33506 .
+              FILTER EXISTS { { ?w wdt:P195 ?m } UNION { ?w wdt:P276 ?m } ?w wdt:P31 wd:Q3305213 . }
               SERVICE wikibase:label { bd:serviceParam wikibase:language "en,fr,de,es,it". }
-            } ORDER BY ?dist LIMIT 8
+            } ORDER BY ?dist LIMIT 6
             """
         guard let rows = await Identifier.sparql(query, timeout: 60) else { return [] }
         var seen = Set<String>()
@@ -244,5 +245,6 @@ enum MuseumFinder {
             guard seen.insert(q).inserted else { return nil }
             return Museum(q: q, name: Identifier.label(row["mLabel"]) ?? q)
         }
+        .prefix(4).map { $0 }
     }
 }
