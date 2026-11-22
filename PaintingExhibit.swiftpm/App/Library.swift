@@ -877,7 +877,9 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     /// All edits in a pass are saved in one change, so the system asks for permission once.
     private func writeEditsToPhotos() async {
         guard saveEditsToPhotos else { return }
-        let todo = paintings.filter { $0.photosLeftAlone != true && $0.photosRecipe != $0.settings }
+        let todo = paintings.filter { p in
+            p.photosLeftAlone != true && !(p.photosRecipe.map { $0.looksSame(as: p.settings) } ?? false)
+        }
         guard !todo.isEmpty else { return }
         progressDone = 0
         progressTotal = todo.count
@@ -895,6 +897,11 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                     if let format = source.existingFormat, format != Self.adjustmentFormat, painting.photosRecipe != nil {
                         // Edited elsewhere after this app saved its edit: leave it alone.
                         markLeftAlone(painting.id)
+                        continue
+                    }
+                    if let existing = source.existingRecipe, existing.looksSame(as: painting.settings) {
+                        // Already carries this edit (saved earlier, or by this app on another of your devices).
+                        if let i = paintings.firstIndex(where: { $0.id == painting.id }) { paintings[i].photosRecipe = existing }
                         continue
                     }
                     let output = PHContentEditingOutput(contentEditingInput: source.input)
@@ -919,6 +926,7 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
             }
             for group in await commit(edits) { failures.append(group) }
         }
+        save()
         if failures.isEmpty {
             lastError = nil
         } else {
@@ -1038,6 +1046,11 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         var input: PHContentEditingInput
         /// The format of the edit the photo carries now, if any.
         var existingFormat: String?
+        /// The recipe of this app's edit the photo carries now (saved here or on another of your devices).
+        var existingRecipe: ProcessingSettings? {
+            guard existingFormat == Library.adjustmentFormat, let data = input.adjustmentData?.data else { return nil }
+            return try? JSONDecoder().decode(ProcessingSettings.self, from: data)
+        }
     }
 
     private final class FormatBox: @unchecked Sendable { var format: String? }

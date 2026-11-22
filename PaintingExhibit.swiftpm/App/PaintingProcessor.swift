@@ -75,6 +75,23 @@ struct ProcessingSettings: Codable, Hashable {
     var blackPoint: Float?
     var exposure: Float?
 
+    /// Whether two recipes give the same picture as far as anyone could see: the same crop (within a fraction
+    /// of a percent), frame choice and white balance, and nearly the same exposure. The automatic parts are
+    /// worked out on each device and can differ in the last decimal places.
+    func looksSame(as other: ProcessingSettings) -> Bool {
+        func close(_ a: [NormPoint]?, _ b: [NormPoint]?) -> Bool {
+            switch (a, b) {
+            case (nil, nil): return true
+            case let (a?, b?): return a.count == b.count && zip(a, b).allSatisfy { abs($0.x - $1.x) < 0.004 && abs($0.y - $1.y) < 0.004 }
+            default: return false
+            }
+        }
+        return keptFrame == other.keptFrame && colour == other.colour
+            && close(paintingQuad, other.paintingQuad) && (keptFrame || close(canvasQuad, other.canvasQuad))
+            && abs((exposure ?? 1) - (other.exposure ?? 1)) < 0.03
+            && abs((blackPoint ?? 0) - (other.blackPoint ?? 0)) < 0.005
+    }
+
     var cropFound: Bool { paintingQuad != nil }
     var frameFound: Bool { canvasQuad != nil }
     var frameRemoved: Bool { frameFound && !keptFrame }
