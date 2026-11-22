@@ -64,7 +64,8 @@ struct CropEditor: View {
         .tint(.white)
         .background(Color.black.ignoresSafeArea())
         .task {
-            corners = library.currentCrop(of: painting).map { CGPoint(x: $0.x, y: 1 - $0.y) }
+            // An automatic outline can run off the photo; start every corner on it, where it can be dragged.
+            corners = library.currentCrop(of: painting).map { CGPoint(x: min(max($0.x, 0), 1), y: min(max(1 - $0.y, 0), 1)) }
             photo = await library.editorPhoto(for: painting)
             failed = photo == nil
         }

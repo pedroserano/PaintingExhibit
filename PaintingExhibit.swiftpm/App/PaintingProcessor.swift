@@ -427,7 +427,9 @@ enum PaintingProcessor {
         // Square it up from the frame's own edges: an outline that missed the perspective (or the whole photo of
         // a painting shot from below or one side) leaves the frame a trapezoid.
         for _ in 0..<(forcedQuad == nil ? 2 : 0) {
-            guard let squarer = straighten(quad, in: base) else { break }
+            // A painting is in the photo: a squaring that puts corners well outside it has followed the wrong lines.
+            guard let squarer = straighten(quad, in: base),
+                  squarer.allSatisfy({ $0.x > -0.02 && $0.x < 1.02 && $0.y > -0.02 && $0.y < 1.02 }) else { break }
             quad = squarer
         }
         settings.paintingQuad = quad
@@ -517,7 +519,9 @@ enum PaintingProcessor {
         let quads = (request.results ?? []).map { o in
             [o.topLeft, o.topRight, o.bottomRight, o.bottomLeft].map { NormPoint(x: Double($0.x), y: Double($0.y)) }
         }
+        // Vision can extend a shape past the photo's edges; a painting in the photo stays inside it.
         return quads
+            .filter { $0.allSatisfy { $0.x > -0.1 && $0.x < 1.1 && $0.y > -0.1 && $0.y < 1.1 } }
             .filter { accept(area(of: $0), center(of: $0)) }
             .sorted { area(of: $0) > area(of: $1) }
     }
@@ -653,6 +657,22 @@ enum PaintingProcessor {
     /// mat) holds however carved it is, until the canvas starts. The rail is sampled just inside `known` (the
     /// depth already found to be frame), or from 3% in when none was found, since the outermost pixels are often
     /// a sliver of wall. Only an end that falls on one of the side's straight `lines` counts.
+    /// Whether the band just outside a line `to` pixels in from the side looks like frame: its colour make-up
+    /// differs from the painting's centre and from the band just inside the line.
+    private static func bandIsFrame(_ side: SideReader, to depth: Int, centre: [Float]) -> Bool {
+        let span = max(4, side.across * 3 / 100)
+        guard depth - span >= 1, depth + span < side.across / 2 else { return false }
+        let along = Array(stride(from: side.length * 10 / 100, to: side.length * 90 / 100, by: 2))
+        func histogram(_ depths: Range<Int>) -> [Float] {
+            var counts = [Float](repeating: 0, count: 64)
+            for d in depths { for t in along { counts[colourBin(side.sample(d, t))] += 1 } }
+            let total = counts.reduce(0, +)
+            return counts.map { $0 / max(total, 1) }
+        }
+        let outside = histogram((depth - span)..<(depth - 1)), inside = histogram((depth + 2)..<(depth + span))
+        return histogramDistance(outside, centre) > 0.4 && histogramDistance(outside, inside) > 0.3
+    }
+
     private static func railDepth(_ side: SideReader, known: Int, lines: [(depth: Int, score: Float)],
                                   centre: [Float]) -> Int? {
         let maxDepth = side.across * 35 / 100
@@ -818,6 +838,35 @@ enum PaintingProcessor {
                   Double(min(ra, rb)) >= Double(max(ra, rb)) * ratio else { continue }
             depths[a] = max(depths[a], ra)
             depths[b] = max(depths[b], rb)
+        }
+
+        // Hand-fixed crops showed the canvas edge is nearly always the deepest strong line on its side: a frame's
+        // mouldings, lip and slip each make a line on the way in, and stopping at any of them leaves frame behind.
+        // So move in to it. A painting's own lines rarely run its full length; to be safe, opposite sides must
+        // land about as deep (top and bottom may differ more: the frame's shadow falls below it).
+        // The band given up must look like frame, not painting: its colours unlike the painting's centre and unlike
+        // what lies just inside the line (an unframed painting's own stripes and edges would otherwise be cut off).
+        var deepest = depths
+        // Not where no frame was seen at all: there the strong lines are the painting's own.
+        let noFrameSeen = depths.allSatisfy { $0 == 0 }
+        for i in 0..<4 where !noFrameSeen {
+            let strongest = sides[i].map(\.score).max() ?? 0
+            let candidates = sides[i].filter { $0.depth > depths[i] && $0.score >= max(0.12, strongest * 0.5) }.map(\.depth)
+            if let line = candidates.sorted().reversed().first(where: { bandIsFrame(sideReaders[i], to: $0, centre: centre) }) {
+                deepest[i] = line
+            }
+        }
+        for (a, b, ratio) in [(0, 1, 0.6), (2, 3, 0.3)] {
+            let da = Double(deepest[a]) / Double(sideReaders[a].across)
+            let db = Double(deepest[b]) / Double(sideReaders[b].across)
+            if min(da, db) >= max(da, db) * ratio || max(da, db) < 0.03 {
+                depths[a] = deepest[a]
+                depths[b] = deepest[b]
+            } else if da < db {
+                depths[a] = deepest[a]      // unpaired: keep only the shallower side's move
+            } else {
+                depths[b] = deepest[b]
+            }
         }
 
         // Then, side by side, trim a leftover sliver of frame: a narrow strip at the edge that is plain along
