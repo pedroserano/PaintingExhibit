@@ -87,12 +87,12 @@ enum IdentifyError: LocalizedError {
 /// Only the cropped painting is sent to Google (small, with no location or other photo details). Wikidata
 /// and Wikimedia Commons receive only the names and IDs being looked up.
 enum Identifier {
-    /// Distances at or under this are the same painting. Measured on the album's photos against works' large
-    /// images: matches up to 0.42 were all right; between 0.42 and 0.58 about half were (details, other
-    /// versions, look-alikes), so those are left to be checked; different paintings were mostly 0.6 and over.
-    static let sameWork: Float = 0.42
+    /// Distances (1 − similarity of MobileCLIP fingerprints) at or under this are the same painting. Measured on
+    /// hand-checked pairs from the album against works' images: the same painting came out 0.03–0.15, different
+    /// paintings 0.10 and over (mostly far more), so matches between the two are left to be checked.
+    static let sameWork: Float = 0.08
     /// Distances at or under this are probably the same painting, or another version of it.
-    static let likelyWork: Float = 0.58
+    static let likelyWork: Float = 0.14
     /// Identifies the client to Wikidata and Wikimedia Commons, as they ask.
     static let userAgent = "PaintingExhibit/0.2 (https://github.com/pedroserano/PaintingExhibit)"
 
@@ -106,7 +106,7 @@ enum Identifier {
 
     /// Works out the painting from what Google found, comparing candidates with the photo.
     static func resolve(_ web: WebResult, photo crop: CGImage) async -> Identification {
-        let photoPrint = featurePrint(crop)
+        let photoPrint = await featurePrint(crop)
 
         // Works Google's entities are known as in Wikidata; failing that, works whose names Google suggests.
         var works = await artworks(forEntityIDs: web.entities.map(\.id))
@@ -166,7 +166,7 @@ enum Identifier {
     }
 
     /// The candidates with each one's image compared with the photo, best first.
-    static func compared(_ works: [Candidate], with photoPrint: VNFeaturePrintObservation?, mentioned: String) async -> [Candidate] {
+    static func compared(_ works: [Candidate], with photoPrint: [Float]?, mentioned: String) async -> [Candidate] {
         var candidates: [Candidate] = []
         for work in works {
             var c = work
@@ -185,13 +185,13 @@ enum Identifier {
     /// Looks the photo up among the paintings of the museums it was taken in: the nearest few by thumbnail
     /// fingerprint, then each checked against the work's large image.
     static func fromMuseum(_ index: MuseumIndex, photo crop: CGImage) async -> Identification? {
-        guard let photoPrint = featurePrint(crop), let vector = vector(of: photoPrint) else { return nil }
-        let shortlist = await Task.detached { index.nearest(to: vector, count: 4) }.value
+        guard let photoPrint = await featurePrint(crop) else { return nil }
+        let shortlist = await Task.detached { index.nearest(to: photoPrint, count: 4) }.value
         guard !shortlist.isEmpty else { return nil }
         let candidates = await compared(shortlist.map(\.work.candidate), with: photoPrint, mentioned: "")
         var result = Identification(status: .unidentified, searchedAt: Date())
         result.via = "the museum's collection"
-        result.candidates = candidates.filter { ($0.distance ?? 1) <= 0.75 }
+        result.candidates = candidates.filter { ($0.distance ?? 1) <= 0.25 }
         if let best = candidates.first, let d = best.distance, d <= likelyWork {
             result.status = d <= sameWork ? .matched : .possible
             result.apply(best)
@@ -223,7 +223,7 @@ enum Identifier {
         let named = { (c: Candidate) in c.artist.map { text.contains($0.lowercased()) } ?? false }
         works = works.filter(named) + works.filter { !named($0) }
         guard !works.isEmpty else { return nil }
-        let candidates = await compared(Array(works.prefix(6)), with: featurePrint(crop), mentioned: text)
+        let candidates = await compared(Array(works.prefix(6)), with: await featurePrint(crop), mentioned: text)
         var result = Identification(status: .unidentified, searchedAt: Date())
         result.via = "the caption label"
         result.candidates = candidates
@@ -235,6 +235,24 @@ enum Identifier {
                 result.status = .matched
                 result.apply(best)
             }
+        }
+        return result
+    }
+
+    /// Looks up a work by a name you give (from Apple's Look Up, a label, anywhere): Wikidata's works by that
+    /// name, each compared with the photo.
+    static func fromName(_ name: String, photo crop: CGImage) async -> Identification {
+        var works: [Candidate] = []
+        for found in [await artworks(searching: name), await artworks(named: name)] {
+            for w in found.prefix(8) where !works.contains(where: { $0.wikidata == w.wikidata }) { works.append(w) }
+        }
+        let candidates = await compared(Array(works.prefix(10)), with: await featurePrint(crop), mentioned: name.lowercased())
+        var result = Identification(status: .unidentified, searchedAt: Date())
+        result.via = "the name you gave"
+        result.candidates = candidates
+        if let best = candidates.first, let d = best.distance, d <= likelyWork {
+            result.status = .matched
+            result.apply(best)
         }
         return result
     }
@@ -483,49 +501,37 @@ enum Identifier {
 
     // MARK: Comparing images on the device
 
-    static func featurePrint(_ image: CGImage) -> VNFeaturePrintObservation? {
-        let request = VNGenerateImageFeaturePrintRequest()
-        try? VNImageRequestHandler(cgImage: image).perform([request])
-        return request.results?.first
+    /// The photo's (or a work's) fingerprint from Apple's MobileCLIP model, on the device.
+    static func featurePrint(_ image: CGImage) async -> [Float]? {
+        guard let embedder = await Embedder.shared() else { return nil }
+        return embedder.vector(image)
     }
 
-    static func distance(_ a: VNFeaturePrintObservation, _ b: VNFeaturePrintObservation) -> Float? {
-        var d: Float = 0
-        do { try a.computeDistance(&d, to: b) } catch { return nil }
-        return d
+    /// How different two fingerprints are: 0 the same picture, around 0.1 or less the same painting
+    /// photographed differently, 0.15 and more different paintings.
+    static func distance(_ a: [Float], _ b: [Float]) -> Float? {
+        guard a.count == b.count, !a.isEmpty else { return nil }
+        return 1 - zip(a, b).map(*).reduce(0, +)
     }
 
-    /// A feature print's numbers, for searching many at once.
-    static func vector(of print: VNFeaturePrintObservation) -> [Float]? {
-        guard print.elementType == .float else { return nil }
-        return print.data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-    }
-
-    /// The feature print numbers of an image file's contents.
-    static func featurePrintVector(_ data: Data) -> [Float]? {
+    /// The fingerprint of an image file's contents.
+    static func featurePrintVector(_ data: Data) async -> [Float]? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
                 kCGImageSourceCreateThumbnailFromImageAlways: true,
                 kCGImageSourceThumbnailMaxPixelSize: 1024,
                 kCGImageSourceCreateThumbnailWithTransform: true
-              ] as CFDictionary),
-              let print = featurePrint(image) else { return nil }
-        return vector(of: print)
+              ] as CFDictionary) else { return nil }
+        return await featurePrint(image)
     }
 
-    private static func remotePrint(_ urlString: String) async -> VNFeaturePrintObservation? {
+    private static func remotePrint(_ urlString: String) async -> [Float]? {
         guard let url = URL(string: urlString) else { return nil }
         var request = URLRequest(url: url)
         request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 30
-        guard let (data, _) = try? await URLSession.shared.data(for: request),
-              let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
-                kCGImageSourceCreateThumbnailFromImageAlways: true,
-                kCGImageSourceThumbnailMaxPixelSize: 1024,
-                kCGImageSourceCreateThumbnailWithTransform: true
-              ] as CFDictionary) else { return nil }
-        return featurePrint(image)
+        guard let (data, _) = try? await URLSession.shared.data(for: request) else { return nil }
+        return await featurePrintVector(data)
     }
 
     // MARK: Reading text

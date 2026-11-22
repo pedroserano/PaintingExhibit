@@ -64,6 +64,8 @@ struct DetailsPanel: View {
     @State private var year = ""
     @State private var museum = ""
     @State private var error: String?
+    @State private var lookupName = ""
+    @State private var lookupNote: String?
 
     private var painting: Painting? { library.paintings.first { $0.id == paintingID } }
     private var identity: Identification? { painting?.identification }
@@ -72,15 +74,18 @@ struct DetailsPanel: View {
     var body: some View {
         Form {
             statusSection
+            if let painting { LookUpSection(painting: painting).id(painting.id) }
+            nameSection
             if let identity, !identity.candidates.isEmpty { candidatesSection(identity) }
             detailsSection
-            if let painting { LookUpSection(painting: painting).id(painting.id) }
             if let identity, !identity.pages.isEmpty || !identity.clues.isEmpty { webSection(identity) }
         }
         .formStyle(.grouped)
         .onAppear(perform: loadFields)
         .onChange(of: paintingID) {
             error = nil
+            lookupName = ""
+            lookupNote = nil
             loadFields()
         }
         .onChange(of: identity) { loadFields() }
@@ -186,6 +191,35 @@ struct DetailsPanel: View {
                     }
                 }
             }
+        }
+    }
+
+    /// Finding the work by a name: what Apple's Look Up shows, a label, anything.
+    private var nameSection: some View {
+        Section {
+            HStack {
+                TextField("Painting's name", text: $lookupName)
+                    .onSubmit(findByName)
+                Button("Find", action: findByName)
+                    .disabled(lookupName.trimmingCharacters(in: .whitespaces).isEmpty || searching)
+            }
+            if let lookupNote { Text(lookupNote).font(.footnote).foregroundStyle(.secondary) }
+        } header: {
+            Text("Find by name")
+        } footer: {
+            Text("Type or paste the name Apple's Look Up (above) shows, or from a label. The app finds the work and checks its image against your photo.")
+        }
+    }
+
+    private func findByName() {
+        let name = lookupName
+        lookupNote = nil
+        Task {
+            let matched = await library.find(named: name, for: paintingID)
+            loadFields()
+            lookupNote = matched ? nil
+                : (identity?.candidates.isEmpty ?? true) ? "No work by that name was found." : "No image matched for certain: if one of the candidates is it, choose This One."
+            if matched { lookupName = "" }
         }
     }
 

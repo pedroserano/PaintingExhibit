@@ -538,6 +538,35 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         return index.works.isEmpty ? nil : index
     }
 
+    /// Looks a painting up by a name you give. A work by that name whose image matches the photo is taken as
+    /// confirmed (you named it, and the images agree); otherwise the works found are offered to choose from.
+    /// Returns whether a match was found.
+    @discardableResult
+    func find(named name: String, for id: String) async -> Bool {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, let painting = paintings.first(where: { $0.id == id }),
+              let url = await imageURL(for: painting),
+              let crop = Identifier.loadImage(url, maxPixel: 1024) else { return false }
+        searching.insert(id)
+        defer { searching.remove(id) }
+        var found = await Identifier.fromName(name, photo: crop)
+        guard let i = paintings.firstIndex(where: { $0.id == id }) else { return false }
+        let previous = paintings[i].identification
+        found.museums = previous?.museums ?? []
+        found.searchVersion = Self.searchVersion
+        if found.status == .matched {
+            found.status = .confirmed
+            paintings[i].identification = found
+        } else {
+            // Keep what was known; put the works found first among the candidates.
+            var kept = previous ?? Identification(status: .unidentified, searchedAt: Date())
+            kept.candidates = found.candidates + kept.candidates.filter { c in !found.candidates.contains { $0.id == c.id } }
+            paintings[i].identification = kept
+        }
+        save()
+        return found.status == .matched
+    }
+
     /// Takes one of the candidates as the painting, confirmed.
     func confirm(_ candidate: Candidate, for id: String) {
         guard let i = paintings.firstIndex(where: { $0.id == id }) else { return }

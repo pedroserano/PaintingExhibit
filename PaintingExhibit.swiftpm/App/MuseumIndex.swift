@@ -38,8 +38,11 @@ final class MuseumIndex: @unchecked Sendable {
     /// All of the museums' paintings with images, as last listed.
     private var listed: [IndexedWork] = []
 
-    /// Small thumbnails keep the download modest (about 15 KB a painting); they are only used to shortlist.
-    static let thumbnailWidth = 250
+    /// Small thumbnails keep the download modest (about 25 KB a painting); MobileCLIP recognises paintings
+    /// reliably at this size.
+    static let thumbnailWidth = 330
+    /// The fingerprints kept: an index made with another kind is fetched again.
+    static let kind = Embedder.name
 
     init(key: String) { self.key = key }
 
@@ -54,23 +57,21 @@ final class MuseumIndex: @unchecked Sendable {
 
     // MARK: Searching
 
-    /// The `count` works whose fingerprints are closest to the photo's, closest first.
+    /// The `count` works whose fingerprints are closest to the photo's, closest first, with their distance
+    /// (1 − similarity).
     func nearest(to print: [Float], count: Int) -> [(work: IndexedWork, distance: Float)] {
         guard dimension > 0, print.count == dimension else { return [] }
         var scored: [(Int, Float)] = []
         scored.reserveCapacity(works.count)
         vectors.withUnsafeBufferPointer { v in
             for i in 0..<works.count {
-                var sum: Float = 0
+                var dot: Float = 0
                 let base = i * dimension
-                for k in 0..<dimension {
-                    let d = print[k] - v[base + k]
-                    sum += d * d
-                }
-                scored.append((i, sum))
+                for k in 0..<dimension { dot += print[k] * v[base + k] }
+                scored.append((i, 1 - dot))
             }
         }
-        return scored.sorted { $0.1 < $1.1 }.prefix(count).map { (works[$0.0], $0.1.squareRoot()) }
+        return scored.sorted { $0.1 < $1.1 }.prefix(count).map { (works[$0.0], $0.1) }
     }
 
     // MARK: Building
@@ -130,7 +131,7 @@ final class MuseumIndex: @unchecked Sendable {
         for attempt in 0..<3 {
             if let (data, response) = try? await session.data(from: url) {
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-                if status == 200, let print = Identifier.featurePrintVector(data) { return print }
+                if status == 200, let print = await Identifier.featurePrintVector(data) { return print }
                 if status == 404 { return nil }
             }
             // Wikimedia asks clients to slow down when busy: back off and try again.
@@ -178,6 +179,7 @@ final class MuseumIndex: @unchecked Sendable {
         var failures: [String: Int]
         var listed: [IndexedWork]
         var listedAt: Date?
+        var kind: String?
     }
 
     static var folder: URL {
@@ -191,7 +193,7 @@ final class MuseumIndex: @unchecked Sendable {
     private var vectorURL: URL { Self.folder.appendingPathComponent(key + ".f32") }
 
     func save() {
-        let meta = Saved(works: works, dimension: dimension, failures: failures, listed: listed, listedAt: listedAt)
+        let meta = Saved(works: works, dimension: dimension, failures: failures, listed: listed, listedAt: listedAt, kind: Self.kind)
         guard let data = try? JSONEncoder().encode(meta) else { return }
         let bytes = vectors.withUnsafeBufferPointer { Data(buffer: $0) }
         try? bytes.write(to: vectorURL, options: .atomic)
@@ -201,7 +203,7 @@ final class MuseumIndex: @unchecked Sendable {
     static func load(key: String) -> MuseumIndex {
         let index = MuseumIndex(key: key)
         guard let data = try? Data(contentsOf: index.metaURL),
-              let meta = try? JSONDecoder().decode(Saved.self, from: data),
+              let meta = try? JSONDecoder().decode(Saved.self, from: data), meta.kind == Self.kind,
               let bytes = try? Data(contentsOf: index.vectorURL) else { return index }
         let vectors: [Float] = bytes.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
         guard vectors.count == meta.works.count * meta.dimension else { return index }
