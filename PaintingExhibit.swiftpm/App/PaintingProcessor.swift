@@ -649,6 +649,61 @@ enum PaintingProcessor {
         return total / Float(max(1, hi - lo))
     }
 
+    /// How deep a frame's rail runs on one side, judged by its colours: the rail's colour make-up (gold, wood, a
+    /// mat) holds however carved it is, until the canvas starts. The rail is sampled just inside `known` (the
+    /// depth already found to be frame), or from 3% in when none was found, since the outermost pixels are often
+    /// a sliver of wall. Only an end that falls on one of the side's straight `lines` counts.
+    private static func railDepth(_ side: SideReader, known: Int, lines: [(depth: Int, score: Float)],
+                                  centre: [Float]) -> Int? {
+        let maxDepth = side.across * 35 / 100
+        let span = max(4, side.across * 3 / 100)
+        guard maxDepth > 16 else { return nil }
+        let along = Array(stride(from: side.length * 10 / 100, to: side.length * 90 / 100, by: 2))
+        // Colour make-up of a band of depths: a 4 × 4 × 4 histogram of sRGB, as fractions.
+        func histogram(_ depths: Range<Int>) -> [Float] {
+            var counts = [Float](repeating: 0, count: 64)
+            for d in depths { for t in along { counts[colourBin(side.sample(d, t))] += 1 } }
+            let total = counts.reduce(0, +)
+            return counts.map { $0 / max(total, 1) }
+        }
+        let start = known > span + 2 ? known - span : span
+        guard start + span < maxDepth else { return nil }
+        let rail = histogram(start..<(start + span))
+        // No frame if that band already looks like the painting's centre.
+        guard histogramDistance(rail, centre) > 0.5 else { return nil }
+        // Walk in while bands keep the reference's make-up. Where they change to something that still doesn't
+        // look like the painting (a frame's shadow on the wall, then the frame; an outer moulding, then the
+        // rail), carry on with that as the reference, up to three times.
+        var reference = rail, end = start + span, segments = 0
+        while true {
+            var depth = end, misses = 0
+            while depth + 3 <= maxDepth {
+                if histogramDistance(histogram(depth..<(depth + 3)), reference) < 0.5 { end = depth + 3; misses = 0 } else { misses += 1 }
+                if misses >= 2 { break }
+                depth += 3
+            }
+            guard segments < 3, end + span < maxDepth else { break }
+            let next = histogram(end..<(end + span))
+            guard histogramDistance(next, centre) > 0.7, histogramDistance(next, reference) >= 0.5 else { break }
+            reference = next
+            end += span
+            segments += 1
+        }
+        guard end > known + 3, end < maxDepth - 3 else { return nil }
+        let near = max(4, side.across * 2 / 100)
+        return lines.filter { abs($0.depth - end) <= near && $0.score >= 0.08 }.max { $0.score < $1.score }?.depth
+    }
+
+    private static func colourBin(_ c: SIMD3<Float>) -> Int {
+        let r = min(3, Int(c.x * 4)), g = min(3, Int(c.y * 4)), b = min(3, Int(c.z * 4))
+        return r * 16 + g * 4 + b
+    }
+
+    /// 0 for the same colour make-up, 1 for nothing in common.
+    private static func histogramDistance(_ a: [Float], _ b: [Float]) -> Float {
+        1 - zip(a, b).map { min($0, $1) }.reduce(0, +)
+    }
+
     // MARK: Finding the canvas inside the frame
 
     /// Finds the frame's inner edge on each side of the straightened painting: the innermost straight line
@@ -746,6 +801,24 @@ enum PaintingProcessor {
             break
         }
         var depths = best?.depths ?? [0, 0, 0, 0]
+
+        // A carved rail is as busy as a painting, so the checks above often stop at its outer mouldings. Its
+        // colours give it away: going in from the edge, bands keep the rail's colour make-up until the canvas.
+        var centreCounts = [Float](repeating: 0, count: 64)
+        for y in stride(from: h * 3 / 10, to: h * 7 / 10, by: 2) {
+            for x in stride(from: w * 3 / 10, to: w * 7 / 10, by: 2) { centreCounts[colourBin(pixel(x, y))] += 1 }
+        }
+        let centreTotal = centreCounts.reduce(0, +)
+        let centre = centreCounts.map { $0 / max(centreTotal, 1) }
+        let rails = (0..<4).map { railDepth(sideReaders[$0], known: depths[$0], lines: sides[$0], centre: centre) }
+        // Rails come in pairs: a plain background running down one side of a painting doesn't. Left and right
+        // must both be found and about as deep; top and bottom may differ more (the frame's shadow below it).
+        for (a, b, ratio) in [(0, 1, 0.6), (2, 3, 0.35)] {
+            guard let ra = rails[a], let rb = rails[b],
+                  Double(min(ra, rb)) >= Double(max(ra, rb)) * ratio else { continue }
+            depths[a] = max(depths[a], ra)
+            depths[b] = max(depths[b], rb)
+        }
 
         // Then, side by side, trim a leftover sliver of frame: a narrow strip at the edge that is plain along
         // its length, ends at a strong straight line, and is plainly quieter than the painting inside it.
