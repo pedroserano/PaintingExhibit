@@ -127,6 +127,25 @@ struct SettingsView: View {
                 Reverting also removes any edits made in Photos before this app's edit.
                 """)
             }
+
+            #if os(macOS)
+            Section {
+                Toggle("Write details to Photos", isOn: $library.writeDetailsToPhotos)
+                if library.detailsTotal > 0 {
+                    ProgressView(value: Double(library.detailsDone), total: Double(library.detailsTotal)) {
+                        Text("Writing details: \(library.detailsDone) of \(library.detailsTotal)")
+                    }
+                }
+            } footer: {
+                Text("""
+                Gives the photos of each painting you confirmed a title (the painting's name), a caption (artist, year \
+                and museum) and keywords (artist and museum) in Photos, which iCloud Photos shows on your other \
+                devices too. Automatic matches aren't written, as they can be wrong. A title or \
+                caption you wrote yourself is never replaced, and your own keywords are kept. The first time, \
+                the Mac asks you to let Painting Exhibit control Photos.
+                """)
+            }
+            #endif
         }
         .formStyle(.grouped)
     }

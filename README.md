@@ -96,6 +96,11 @@ Museum data is kept in the shared folder when you choose one, so each museum is 
 - **Unidentified:** nothing fits. In **Details**, Apple's **Look Up** often names it: type or paste that name
   into **Find by name**, and the app finds the work and checks its image against your photo.
 
+**Write details to Photos** (Mac only, in Settings, off by default) gives each identified painting's photos a
+title, caption (artist, year, museum) and keywords (artist, museum) in Photos, and iCloud Photos carries them to
+your other devices. Only paintings you confirmed are written (an automatic match can be wrong); a title or caption
+you wrote yourself is never replaced, and your own keywords are kept. (iPhone and iPad apps can't change these.)
+
 Details you confirm or type are kept: a later search never replaces them. Your photos stay on the device for the
 free search; Wikidata and Wikimedia Commons receive only the names and IDs being looked up. With Google, only the
 cropped painting goes to Google, without its location or other photo details.

@@ -171,7 +171,12 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         _searchFamous = Published(initialValue: defaults.object(forKey: "searchFamous") as? Bool ?? true)
         _hideDuplicates = Published(initialValue: defaults.object(forKey: "hideDuplicates") as? Bool ?? true)
         printsURL = support.appendingPathComponent("fingerprints.json")
+        _writeDetailsToPhotos = Published(initialValue: defaults.bool(forKey: "writeDetailsToPhotos"))
+        detailsURL = support.appendingPathComponent("photos-details.json")
+        if let data = try? Data(contentsOf: detailsURL),
+           let saved = try? JSONDecoder().decode([String: PhotoDetails].self, from: data) { detailsWritten = saved }
         super.init()
+        if writeDetailsToPhotos { scheduleDetailsToPhotos(after: 10) }
 
         #if os(iOS)
         // Version 0.1 kept full copies in the app's own Documents folder and cache; the new cache replaces them.
@@ -469,6 +474,19 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     @Published var hideDuplicates: Bool {
         didSet { UserDefaults.standard.set(hideDuplicates, forKey: "hideDuplicates") }
     }
+    /// Mac only: whether identified paintings' title, artist and museum are written to the photos in Photos.
+    @Published var writeDetailsToPhotos: Bool {
+        didSet {
+            UserDefaults.standard.set(writeDetailsToPhotos, forKey: "writeDetailsToPhotos")
+            if writeDetailsToPhotos && !oldValue { scheduleDetailsToPhotos(after: 0) }
+        }
+    }
+    /// What this app last wrote to each photo in Photos, so it changes only its own details.
+    var detailsWritten: [String: PhotoDetails] = [:]
+    var detailsURL: URL
+    var detailsTask: Task<Void, Never>?
+    @Published var detailsDone = 0
+    @Published var detailsTotal = 0
     /// For each photo in a group of photos of one painting: the group, the photo shown first.
     @Published private(set) var groups: [String: [String]] = [:]
     @Published private(set) var fingerprintDone = 0
@@ -1461,5 +1479,6 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
         if let data = try? JSONEncoder().encode(paintings) {
             try? data.write(to: indexURL, options: .atomic)
         }
+        if writeDetailsToPhotos { scheduleDetailsToPhotos() }
     }
 }
