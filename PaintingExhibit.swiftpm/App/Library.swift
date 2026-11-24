@@ -404,6 +404,11 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                     }
                     paintings[i].editedAt = entry.editedAt
                 } else if mine > theirs {
+                    // The shared drawing was made before this edit; it's shared again once redrawn.
+                    if entry.manualCrop != p.manualCrop || entry.colour != p.settings.colour || entry.keepFrame != p.keepFrame {
+                        entry.recipe = nil
+                        entry.recipeVersion = nil
+                    }
                     entry.manualCrop = p.manualCrop
                     entry.colour = p.settings.colour
                     entry.keepFrame = p.keepFrame
@@ -426,6 +431,20 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                     entry.identifiedAt = p.identifiedAt ?? mine.searchedAt
                     changedShared = true
                 }
+                // A painting drawn without the corners set by hand (an older version could reuse the drawing from
+                // before the crop was adjusted): draw it again, and stop sharing that drawing.
+                if let manual = paintings[i].manualCrop, paintings[i].version == Self.processingVersion,
+                   !Self.drawn(paintings[i].settings, with: manual) {
+                    if let recipe = entry.recipe, Self.drawn(recipe, with: manual) {} else if entry.recipe != nil {
+                        entry.recipe = nil
+                        entry.recipeVersion = nil
+                        changedShared = true
+                    }
+                    paintings[i].version = 0
+                    stale.insert(p.id)
+                    redraw = true
+                }
+
                 // A recipe from the folder replaces this device's own automatic one (nothing done here by hand).
                 let handEdited = paintings[i].editedAt != nil || paintings[i].manualCrop != nil
                     || paintings[i].settings.colour != nil || paintings[i].keepFrame != nil
@@ -1177,6 +1196,8 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
                 let adopted: SharedEntry? = {
                     guard job == .analyze, let shared, shared.recipe != nil, shared.recipeVersion == Self.processingVersion,
                           !changedInPhotos.contains(id) else { return nil }
+                    // Only a drawing made with the corners set by hand, when there are some.
+                    if let manual = shared.manualCrop, let recipe = shared.recipe, !Self.drawn(recipe, with: manual) { return nil }
                     guard let previous else { return shared }                       // new on this device
                     return (shared.editedAt ?? .distantPast) >= (previous.editedAt ?? .distantPast) ? shared : nil
                 }()
@@ -1461,6 +1482,12 @@ final class Library: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
 
     private func sortByAlbum(_ order: [String: Int]) {
         paintings.sort { (order[$0.id] ?? .max) < (order[$1.id] ?? .max) }
+    }
+
+    /// Whether a recipe was drawn with these corners set by hand.
+    nonisolated static func drawn(_ settings: ProcessingSettings, with manual: ManualCrop) -> Bool {
+        guard settings.canvasQuad == nil, let quad = settings.paintingQuad, quad.count == manual.quad.count else { return false }
+        return zip(quad, manual.quad).allSatisfy { abs($0.x - $1.x) < 1e-6 && abs($0.y - $1.y) < 1e-6 }
     }
 
     private static func fileName(for id: String) -> String {
